@@ -13,7 +13,7 @@ const schoolRoutes = require("./routes/school");
 
 const app = express();
 
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || "*", credentials: true }));
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || "https://resultgenerationsystem-6qrd8ho3t.vercel.app", credentials: true }));
 app.use(express.json({ limit: "10mb" })); // generous limit for base64 logos/signatures/photos
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
