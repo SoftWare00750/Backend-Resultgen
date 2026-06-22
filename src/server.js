@@ -13,8 +13,34 @@ const schoolRoutes = require("./routes/school");
 
 const app = express();
 
-// CORS must be set once, before all routes
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || "https://resultgenerationsystem-6qrd8ho3t.vercel.app", credentials: true }));
+// Allow multiple origins: the env var + common Vercel preview patterns
+const allowedOrigins = new Set(
+  (process.env.CLIENT_ORIGIN || "")
+    .split(",")
+    .map((o) => o.trim().replace(/\/$/, ""))
+    .filter(Boolean)
+);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (curl, Postman, server-to-server)
+      if (!origin) return callback(null, true);
+      const normalised = origin.replace(/\/$/, "");
+      if (
+        allowedOrigins.has(normalised) ||
+        // Allow any *.vercel.app subdomain for preview deployments
+        /^https:\/\/[a-z0-9-]+(\.vercel\.app)$/.test(normalised)
+      ) {
+        return callback(null, true);
+      }
+      console.warn(`CORS blocked: ${origin}`);
+      return callback(new Error(`CORS policy: origin ${origin} not allowed`));
+    },
+    credentials: true,
+  })
+);
+
 app.use(express.json({ limit: "10mb" }));
 
 // Root route — confirms the API is live
@@ -23,11 +49,14 @@ app.get("/", (req, res) => {
     status: "ok",
     message: "RGS API is running",
     version: "1.0.0",
-    endpoints: "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school",
+    endpoints:
+      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school",
   });
 });
 
-app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
+app.get("/health", (req, res) =>
+  res.json({ status: "ok", time: new Date().toISOString() })
+);
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
@@ -41,7 +70,7 @@ app.use("/api/school", schoolRoutes);
 // 404 handler
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
-// Centralized error handler
+// Centralised error handler
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(err.status || 500).json({ error: err.message || "Internal server error" });
