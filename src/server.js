@@ -30,6 +30,8 @@ app.use("/api/school", schoolRoutes);
 // 404 handler
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || "https://resultgenerationsystem-6qrd8ho3t.vercel.app" }));
+
 // Centralized error handler
 app.use((err, req, res, next) => {
   console.error(err);

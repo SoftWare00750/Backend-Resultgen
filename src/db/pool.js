@@ -2,14 +2,18 @@ require("dotenv").config();
 const { Pool } = require("pg");
 
 const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL })
-  : new Pool({
+  ? new Pool({ 
+      connectionString: process.env.DATABASE_URL.replace(/([^?&])(sslmode=)/, '$1?$2'),
+      ssl: { rejectUnauthorized: false }
+    })
+  : new Pool({ 
       host: process.env.PGHOST,
       port: process.env.PGPORT,
       database: process.env.PGDATABASE,
       user: process.env.PGUSER,
-      password: process.env.PGPASSWORD,
+      password: process.env.PGPASSWORD, 
     });
+      
 
 pool.on("error", (err) => {
   console.error("Unexpected Postgres pool error", err);
