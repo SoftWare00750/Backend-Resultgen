@@ -1,9 +1,6 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs");
-const https = require("https");
-const path = require("path");
 
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/users");
@@ -81,23 +78,18 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 4000;
 
-// --- SSL/TLS HTTPS Server Setup ---
-const keyPath = path.join(__dirname, "localhost-key.pem");
-const certPath = path.join(__dirname, "localhost.pem");
-
-if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
-  // If mkcert certificates exist locally, spin up an HTTPS server
-  const sslOptions = {
-    key: fs.readFileSync(keyPath),
-    cert: fs.readFileSync(certPath),
-  };
-
-  https.createServer(sslOptions, app).listen(PORT, () => {
-    console.log(`🔒 Secure RGS backend listening on https://localhost:${PORT}`);
-  });
-} else {
-  // Fallback to HTTP for Production/Staging cloud environments
-  app.listen(PORT, () => {
-    console.log(`🚀 RGS backend listening on http://localhost:${PORT} (Insecure/HTTP mode)`);
-  });
-}
+// Always serve plain HTTP. TLS termination is handled upstream (Render,
+// Vercel, nginx, etc. in production; the Next.js dev proxy locally).
+//
+// A previous version of this file conditionally started an HTTPS server
+// using local, self-signed certificates (localhost-key.pem / localhost.pem)
+// if it found them on disk. Self-signed certs are not trusted by Node's
+// default CA store, so any Node-side fetch (Next.js server-side rewrites,
+// SSR, etc.) to that endpoint failed with:
+//   "self-signed certificate; if the root CA is installed locally, try
+//    running Node.js with --use-system-ca"
+// which is exactly the error blocking login/register for every portal.
+// Removing the self-signed HTTPS branch removes the failure mode entirely.
+app.listen(PORT, () => {
+  console.log(`🚀 RGS backend listening on http://localhost:${PORT}`);
+});
