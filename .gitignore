@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment variables — never commit secrets or machine-specific overrides.
+# A previous commit leaked live Postgres/JWT credentials via .env and shipped
+# a broken NODE_EXTRA_CA_CERTS path via .env.local, which caused:
+#   "self-signed certificate; if the root CA is installed locally, try
+#    running Node.js with --use-system-ca"
+# on every clone of this repo. Keep only .env.example checked in.
+.env
+.env.*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+
+# Local TLS certificates/keys — this backend always serves plain HTTP.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
