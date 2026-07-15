@@ -11,14 +11,45 @@ function sanitizeDatabaseUrl(raw) {
   return raw.replace(/([^?&])(sslmode=)/, "$1?$2");
 }
 
+/**
+ * Strips any ssl*-related query params (sslmode, sslcert, sslkey, sslrootcert)
+ * from a Postgres connection string.
+ *
+ * Why this matters: pg's ConnectionParameters constructor does
+ *   config = Object.assign({}, config, parse(config.connectionString))
+ * i.e. whatever pg-connection-string derives FROM the connection string is
+ * applied *after*, and therefore OVERWRITES, any `ssl` option we pass
+ * explicitly alongside `connectionString`. Since a bare `sslmode=require`
+ * (without `uselibpqcompat=true`) is now parsed as an *empty* ssl object
+ * (strict/verify-full validation - see the pg-connection-string deprecation
+ * warning about 'prefer'/'require'/'verify-ca' being aliases for
+ * 'verify-full'), our explicit `ssl: { rejectUnauthorized: false }` below
+ * was being silently discarded, causing:
+ *   "self-signed certificate; if the root CA is installed locally, try
+ *    running Node.js with --use-system-ca" (DEPTH_ZERO_SELF_SIGNED_CERT)
+ * on every query against Render's self-signed Postgres cert.
+ * Stripping these params means pg-connection-string returns no `ssl` key at
+ * all, so Object.assign leaves our explicit override untouched.
+ */
+function stripSslParams(raw) {
+  const [base, query] = raw.split("?");
+  if (!query) return raw;
+  const kept = query
+    .split("&")
+    .filter((pair) => !/^ssl(mode|cert|key|rootcert)=/i.test(pair));
+  return kept.length ? `${base}?${kept.join("&")}` : base;
+}
+
 function createPool() {
   if (process.env.DATABASE_URL) {
-    const fixed = sanitizeDatabaseUrl(process.env.DATABASE_URL.trim());
+    const fixed = stripSslParams(sanitizeDatabaseUrl(process.env.DATABASE_URL.trim()));
 
     return new Pool({
       connectionString: fixed,
       // Always disable certificate verification for Render/cloud-hosted Postgres.
       // Render uses self-signed certs; rejectUnauthorized: false is the standard fix.
+      // NOTE: this option only takes effect because stripSslParams() above
+      // removes sslmode from the connection string first - see its comment.
       ssl: {
         rejectUnauthorized: false,
       },
