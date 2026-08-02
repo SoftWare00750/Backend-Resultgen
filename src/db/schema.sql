@@ -40,6 +40,15 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
+-- ---------- PLAN TYPE ----------
+DO $$ BEGIN
+  CREATE TYPE plan_type AS ENUM ('starter', 'standard', 'premium');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE TYPE subscription_status AS ENUM ('trialing', 'active', 'past_due', 'cancelled');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 -- ---------- SCHOOL INFO (single row, but keyed for multi-tenant future) ----------
 CREATE TABLE IF NOT EXISTS school_info (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -63,6 +72,60 @@ CREATE TABLE IF NOT EXISTS auth_codes (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_auth_codes_code ON auth_codes(code);
+
+-- ---------- ADMIN SIGNUP CODES ----------
+-- Separate from auth_codes: these are the codes the *system* emails to a
+-- prospective Admin/School Owner/School Proprietor to verify their email
+-- during registration (before an account or auth_codes even exist for
+-- their school). One row per email address; re-requesting overwrites it
+-- subject to a resend cooldown.
+CREATE TABLE IF NOT EXISTS admin_signup_codes (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email          VARCHAR(255) NOT NULL UNIQUE,
+  code           VARCHAR(6) NOT NULL,
+  is_verified    BOOLEAN NOT NULL DEFAULT FALSE,
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  last_sent_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at     TIMESTAMPTZ NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_admin_signup_codes_email ON admin_signup_codes(email);
+
+-- ---------- SUBSCRIPTIONS (one per Admin / school) ----------
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id                   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  plan                      plan_type NOT NULL,
+  status                    subscription_status NOT NULL DEFAULT 'trialing',
+  student_limit             INTEGER,              -- null once trial converts to paid, unlimited-ish
+  trial_student_limit       INTEGER NOT NULL,      -- 10 / 5 / 8 depending on plan
+  trial_ends_at             TIMESTAMPTZ,
+  paystack_customer_code    VARCHAR(100),
+  paystack_authorization_code VARCHAR(100),        -- reusable card token from first charge
+  paystack_email            VARCHAR(255),
+  last_charged_amount_kobo  BIGINT,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id);
+
+-- ---------- PAYMENTS (Paystack transaction log) ----------
+CREATE TABLE IF NOT EXISTS payments (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           UUID REFERENCES users(id) ON DELETE SET NULL,
+  subscription_id   UUID REFERENCES subscriptions(id) ON DELETE SET NULL,
+  reference         VARCHAR(100) NOT NULL UNIQUE,
+  plan              plan_type NOT NULL,
+  student_count     INTEGER NOT NULL DEFAULT 0,
+  amount_kobo       BIGINT NOT NULL,
+  currency          VARCHAR(10) NOT NULL DEFAULT 'NGN',
+  status            VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending | success | failed
+  paystack_raw      JSONB,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_payments_reference ON payments(reference);
 
 -- ---------- SESSIONS (academic year) ----------
 CREATE TABLE IF NOT EXISTS sessions (
@@ -162,4 +225,12 @@ CREATE TRIGGER trg_results_updated_at BEFORE UPDATE ON results
 
 DROP TRIGGER IF EXISTS trg_school_info_updated_at ON school_info;
 CREATE TRIGGER trg_school_info_updated_at BEFORE UPDATE ON school_info
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_subscriptions_updated_at ON subscriptions;
+CREATE TRIGGER trg_subscriptions_updated_at BEFORE UPDATE ON subscriptions
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_payments_updated_at ON payments;
+CREATE TRIGGER trg_payments_updated_at BEFORE UPDATE ON payments
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();

@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { authenticate } = require("../middleware/auth");
+const { isValidPlan, getTrialLimit } = require("../utils/pricing");
 
 function signToken(user) {
   return jwt.sign(
@@ -25,9 +26,11 @@ router.post(
     const {
       name, email, password, role, authCode, phone,
       schoolName, schoolLogo, schoolAddress, schoolMotto, signatureDataUrl,
+      // Admin/School Owner/School Proprietor-only fields:
+      plan, paymentReference, studentCount,
     } = req.body;
 
-    if (!name || !email || !password || !role || !authCode) {
+    if (!name || !email || !password || !role) {
       return res.status(400).json({ error: "Missing required fields" });
     }
     if (!["admin", "teacher", "parent"].includes(role)) {
@@ -37,15 +40,38 @@ router.post(
     const { rows: existingUsers } = await query("SELECT id FROM users WHERE email = $1", [email]);
     if (existingUsers.length) return res.status(409).json({ error: "An account with this email already exists" });
 
-    const { rows: codes } = await query(
-      "SELECT * FROM auth_codes WHERE code = $1 AND role = $2 AND is_used = FALSE",
-      [authCode, role]
-    );
-    const code = codes[0];
-    if (!code) return res.status(400).json({ error: "Invalid or already used authorization code for this role" });
-    if (new Date(code.expires_at) < new Date()) return res.status(400).json({ error: "Authorization code has expired" });
+    // ── Admin/School Owner/School Proprietor: email-verified signup code,
+    // plan selection, and a captured payment method — no pre-issued auth
+    // code, since admins are the ones who *hand out* auth codes to
+    // teachers/parents, not the other way around.
+    let authCodeRow = null;
+    let paymentRow = null;
 
     if (role === "admin") {
+      const { rows: signupCodes } = await query(
+        "SELECT * FROM admin_signup_codes WHERE email = $1 AND is_verified = TRUE",
+        [email]
+      );
+      if (!signupCodes.length) {
+        return res.status(400).json({ error: "Please verify the code sent to your email before continuing" });
+      }
+
+      if (!plan || !isValidPlan(plan)) {
+        return res.status(400).json({ error: "A valid plan (starter, standard, or premium) is required" });
+      }
+
+      if (!paymentReference) {
+        return res.status(400).json({ error: "Payment details are required to register as Admin/School Owner/School Proprietor" });
+      }
+      const { rows: payments } = await query(
+        "SELECT * FROM payments WHERE reference = $1 AND status = 'success'",
+        [paymentReference]
+      );
+      if (!payments.length) {
+        return res.status(400).json({ error: "We couldn't confirm your payment details — please try again" });
+      }
+      paymentRow = payments[0];
+
       if (!schoolName) return res.status(400).json({ error: "School name is required for admin registration" });
       const { rows: schools } = await query("SELECT id FROM school_info LIMIT 1");
       if (schools.length === 0) {
@@ -59,13 +85,25 @@ router.post(
           [schoolName, schoolAddress || null, schoolMotto || null, schoolLogo || null, schools[0].id]
         );
       }
-    }
+    } else {
+      // Teacher / Parent: still go through the Admin-issued auth_codes flow.
+      if (!authCode) return res.status(400).json({ error: "Missing required fields" });
+      const { rows: codes } = await query(
+        "SELECT * FROM auth_codes WHERE code = $1 AND role = $2 AND is_used = FALSE",
+        [authCode, role]
+      );
+      authCodeRow = codes[0];
+      if (!authCodeRow) return res.status(400).json({ error: "Invalid or already used authorization code for this role" });
+      if (new Date(authCodeRow.expires_at) < new Date()) {
+        return res.status(400).json({ error: "Authorization code has expired" });
+      }
 
-    if (role === "teacher") {
-      if (!schoolName) return res.status(400).json({ error: "School name is required for teacher registration" });
-      const { rows: schools } = await query("SELECT name FROM school_info LIMIT 1");
-      if (schools.length && schools[0].name.toLowerCase() !== schoolName.trim().toLowerCase()) {
-        return res.status(400).json({ error: `School name does not match "${schools[0].name}"` });
+      if (role === "teacher") {
+        if (!schoolName) return res.status(400).json({ error: "School name is required for teacher registration" });
+        const { rows: schools } = await query("SELECT name FROM school_info LIMIT 1");
+        if (schools.length && schools[0].name.toLowerCase() !== schoolName.trim().toLowerCase()) {
+          return res.status(400).json({ error: `School name does not match "${schools[0].name}"` });
+        }
       }
     }
 
@@ -77,7 +115,29 @@ router.post(
     );
     const user = inserted[0];
 
-    await query("UPDATE auth_codes SET is_used = TRUE, used_by = $1 WHERE id = $2", [email, code.id]);
+    if (role === "admin") {
+      const raw = paymentRow.paystack_raw ? JSON.parse(paymentRow.paystack_raw) : {};
+      const authorizationCode = raw.authorization?.authorization_code || null;
+      const trialLimit = getTrialLimit(plan);
+      const trialEndsAt = new Date();
+      trialEndsAt.setDate(trialEndsAt.getDate() + 30);
+
+      const { rows: subRows } = await query(
+        `INSERT INTO subscriptions
+           (user_id, plan, status, student_limit, trial_student_limit, trial_ends_at,
+            paystack_authorization_code, paystack_email, last_charged_amount_kobo)
+         VALUES ($1,$2,'trialing',$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [
+          user.id, plan, trialLimit, trialLimit, trialEndsAt.toISOString(),
+          authorizationCode, email, paymentRow.amount_kobo,
+        ]
+      );
+      await query("UPDATE payments SET user_id = $1, subscription_id = $2 WHERE id = $3", [
+        user.id, subRows[0].id, paymentRow.id,
+      ]);
+    } else {
+      await query("UPDATE auth_codes SET is_used = TRUE, used_by = $1 WHERE id = $2", [email, authCodeRow.id]);
+    }
 
     const token = signToken(user);
     res.status(201).json({ token, user: sanitize(user) });

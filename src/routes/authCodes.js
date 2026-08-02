@@ -23,8 +23,8 @@ router.post(
   "/",
   asyncHandler(async (req, res) => {
     const { role } = req.body;
-    if (!["admin", "teacher", "parent"].includes(role)) {
-      return res.status(400).json({ error: "Invalid role" });
+    if (!["teacher", "parent"].includes(role)) {
+      return res.status(400).json({ error: "Invalid role — Admin/School Owner/School Proprietor accounts no longer use pre-issued codes" });
     }
     const code = generateSixDigitCode();
     const expiresAt = new Date();
