@@ -10,6 +10,8 @@ const studentRoutes = require("./routes/students");
 const resultRoutes = require("./routes/results");
 const sessionRoutes = require("./routes/sessions");
 const schoolRoutes = require("./routes/school");
+const adminSignupRoutes = require("./routes/adminSignup");
+const paymentRoutes = require("./routes/payments");
 
 const app = express();
 
@@ -41,7 +43,17 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "10mb" }));
+// `verify` stashes the raw request bytes on req.rawBody so the Paystack
+// webhook handler can compute an HMAC signature over the exact payload sent
+// (JSON.stringify(req.body) is not guaranteed to match byte-for-byte).
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 
 // Root route — confirms the API is live
 app.get("/", (req, res) => {
@@ -50,7 +62,7 @@ app.get("/", (req, res) => {
     message: "RGS API is running",
     version: "1.0.0",
     endpoints:
-      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school",
+      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school, /api/admin-signup, /api/payments",
   });
 });
 
@@ -66,6 +78,8 @@ app.use("/api/students", studentRoutes);
 app.use("/api/results", resultRoutes);
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/school", schoolRoutes);
+app.use("/api/admin-signup", adminSignupRoutes);
+app.use("/api/payments", paymentRoutes);
 
 // 404 handler
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
@@ -77,6 +91,17 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 4000;
+
+function logIntegrationStatus() {
+  const gmailReady = !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+  const paystackReady = !!(process.env.PAYSTACK_SECRET_KEY && process.env.PAYSTACK_PUBLIC_KEY);
+  console.log(
+    `📧 Gmail (admin auth-code emails): ${gmailReady ? "configured" : "NOT configured — codes will only be logged to this console"}`
+  );
+  console.log(
+    `💳 Paystack (payments): ${paystackReady ? "configured" : "NOT configured — /api/payments/initialize will return an error until PAYSTACK_SECRET_KEY / PAYSTACK_PUBLIC_KEY are set"}`
+  );
+}
 
 // Always serve plain HTTP. TLS termination is handled upstream (Render,
 // Vercel, nginx, etc. in production; the Next.js dev proxy locally).
@@ -92,4 +117,5 @@ const PORT = process.env.PORT || 4000;
 // Removing the self-signed HTTPS branch removes the failure mode entirely.
 app.listen(PORT, () => {
   console.log(`🚀 RGS backend listening on http://localhost:${PORT}`);
+  logIntegrationStatus();
 });

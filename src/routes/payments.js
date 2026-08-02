@@ -27,6 +27,14 @@ function makeReference() {
 router.post(
   "/initialize",
   asyncHandler(async (req, res) => {
+    if (!process.env.PAYSTACK_SECRET_KEY || !process.env.PAYSTACK_PUBLIC_KEY) {
+      const err = new Error(
+        "Payments are not configured on this server — set PAYSTACK_SECRET_KEY and PAYSTACK_PUBLIC_KEY in .env (see env.example)."
+      );
+      err.status = 500;
+      throw err;
+    }
+
     const { email, plan, studentCount } = req.body;
     if (!email || !plan) return res.status(400).json({ error: "Email and plan are required" });
     if (!isValidPlan(plan)) return res.status(400).json({ error: "Invalid plan" });

@@ -60,10 +60,13 @@ router.post(
       );
     }
 
-    await sendAdminAuthCodeEmail(email, code);
+    const emailResult = await sendAdminAuthCodeEmail(email, code);
 
     res.status(200).json({
-      message: "Verification code sent",
+      message: emailResult.devMode
+        ? "Verification code generated — email is not configured on this server, check the backend logs for the code."
+        : "Verification code sent",
+      devMode: emailResult.devMode,
       cooldownSeconds: RESEND_COOLDOWN_SECONDS,
       expiresInMinutes: CODE_EXPIRY_MINUTES,
     });

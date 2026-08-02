@@ -116,7 +116,12 @@ router.post(
     const user = inserted[0];
 
     if (role === "admin") {
-      const raw = paymentRow.paystack_raw ? JSON.parse(paymentRow.paystack_raw) : {};
+      // `paystack_raw` is a JSONB column — node-postgres already parses it
+      // into a plain object when it comes back from a SELECT/UPDATE...RETURNING,
+      // so re-parsing it with JSON.parse() here would throw
+      // ("Unexpected token o in JSON") and break registration right after a
+      // successful charge. Use it directly.
+      const raw = paymentRow.paystack_raw || {};
       const authorizationCode = raw.authorization?.authorization_code || null;
       const trialLimit = getTrialLimit(plan);
       const trialEndsAt = new Date();
