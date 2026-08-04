@@ -7,8 +7,8 @@ node_modules/
 #   "self-signed certificate; if the root CA is installed locally, try
 #    running Node.js with --use-system-ca"
 # on every clone of this repo. Keep only .env.example checked in.
-.env
-.env.*
+
+
 !.env.example
 
 # Logs
