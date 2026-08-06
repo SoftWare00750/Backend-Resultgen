@@ -296,8 +296,32 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
     } catch (err) {
       console.error(`[email] Resend send to ${toEmail} failed:`, err.message);
       console.error(`[email] For reference, the code that failed to send was: ${code}`);
-      const wrapped = new Error(`Could not send verification email: ${err.message}`);
-      wrapped.status = err.status && err.status < 500 ? 502 : 502;
+
+      let hint = "";
+      const msg = err.message || "";
+      if (err.status === 403 && /domain is not verified/i.test(msg)) {
+        const consumerDomain = /@(gmail|yahoo|outlook|hotmail|live|icloud)\.com\s*$/i.test(resendConfig.from);
+        hint = consumerDomain
+          ? " (You can't send FROM a @gmail.com/@yahoo.com/etc address through Resend — that domain belongs to " +
+            "Google, not you, and Resend can only send as domains you've proven you own via DNS records. To send " +
+            "as this exact Gmail address, use Gmail's own SMTP instead: set GMAIL_USER=" + resendConfig.from +
+            " and GMAIL_APP_PASSWORD (16-char App Password from https://myaccount.google.com/apppasswords, needs " +
+            "2-Step Verification on), then set EMAIL_PROVIDER=smtp — or simply remove RESEND_API_KEY — so this app " +
+            "uses that path instead of Resend.)"
+          : " (RESEND_FROM_EMAIL is set to an address on a domain you haven't verified in Resend. Verify your " +
+            "own domain at https://resend.com/domains and set RESEND_FROM_EMAIL to an address on it, or unset " +
+            "RESEND_FROM_EMAIL entirely to use Resend's sandbox sender onboarding@resend.dev for testing — note " +
+            "the sandbox sender can only deliver to the email address you signed up to Resend with.)";
+      } else if (err.status === 403 && /only send testing emails to your own email/i.test(msg)) {
+        hint =
+          ` (You're using Resend's sandbox sender (no verified domain), which can only deliver to the email ` +
+          `address your Resend account is registered with. To test right now, request the code using that same ` +
+          `email address. To send to any recipient — required for real signups — verify a domain you own at ` +
+          `https://resend.com/domains, then set RESEND_FROM_EMAIL to an address on it.)`;
+      }
+
+      const wrapped = new Error(`Could not send verification email: ${err.message}${hint}`);
+      wrapped.status = 502;
       throw wrapped;
     }
   }
