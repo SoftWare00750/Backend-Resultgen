@@ -1,8 +1,41 @@
+const dns = require("dns");
+const { promisify } = require("util");
 const nodemailer = require("nodemailer");
 
-// Cache whichever transporter config actually works so we don't re-probe
-// on every request once we know which one gets through.
-let workingTransportConfig = null;
+const dnsResolve4 = promisify(dns.resolve4);
+const dnsLookup = promisify(dns.lookup);
+
+// ───────────────────────────────────────────────────────────────────────
+// WHY THIS FILE LOOKS THE WAY IT DOES
+//
+// The original ENETUNREACH error (connecting to an IPv6 address like
+// 2607:f8b0:4004:c07::6d on port 465/587) kept happening *even with*
+// `family: 4` set on the nodemailer transport. That's because nodemailer
+// 9.x's own DNS layer (lib/shared/index.js -> resolveHostname) resolves
+// BOTH the A (IPv4) and AAAA (IPv6) records for smtp.gmail.com and then
+// picks a RANDOM address from the combined list to actually connect to —
+// it does not read/respect the `family` option at all. On a host whose
+// container has no real outbound IPv6 route (common on Render and many
+// other PaaS providers), every time it randomly picks one of Gmail's
+// IPv6 addresses, the connection fails immediately with ENETUNREACH,
+// which is exactly the symptom reported.
+//
+// Two independent fixes are applied below:
+//
+// 1. PREFERRED: an HTTP-based email API (Resend). This sends mail over a
+//    normal HTTPS POST on port 443 — no SMTP, no IPv4/IPv6 lottery, no
+//    port 465/587 to be blocked. This is the most reliable option on
+//    hosts like Render and is what the previous error message itself
+//    recommended. Enabled by setting RESEND_API_KEY.
+//
+// 2. FALLBACK: Gmail SMTP, kept working for anyone who wants to keep
+//    using it, but fixed to bypass nodemailer's buggy dual-stack
+//    resolution entirely — we resolve the A (IPv4-only) record ourselves
+//    with Node's `dns` module and hand nodemailer the literal IPv4
+//    address as `host`, with `servername` set explicitly so TLS
+//    certificate validation still checks against "smtp.gmail.com" (the
+//    name the certificate is actually issued for) instead of the IP.
+// ───────────────────────────────────────────────────────────────────────
 
 // Errors that mean "we couldn't even open a TCP connection" as opposed to
 // "we connected fine but auth/sending failed". Only these should trigger a
@@ -27,32 +60,89 @@ function isConnectionLevelError(err) {
   return /connection timeout|greeting never received/i.test(err.message || "");
 }
 
-/**
- * Two ways to reach Gmail's SMTP, tried in order. 465/SSL is tried first
- * (fewer round trips), falling back to 587/STARTTLS if the connection
- * itself fails — some networks/hosts allow one port but not the other.
- *
- * `family: 4` forces IPv4. This matters a lot in containers/cloud VMs
- * where Node resolves smtp.gmail.com to an IPv6 address first and that
- * route is silently dead — that alone produces the exact "Connection
- * timeout" symptom even though the account/credentials are fine.
- *
- * The three *Timeout options bound how long we wait before giving up, so a
- * genuinely blocked port fails in ~10s instead of hanging for nodemailer's
- * default ~2 minutes before the user sees any error.
- */
-function buildTransportConfigs(user, pass) {
-  const shared = {
-    family: 4,
-    connectionTimeout: 10_000,
-    greetingTimeout: 10_000,
-    socketTimeout: 10_000,
-    auth: { user, pass },
-  };
-  return [
-    { ...shared, host: "smtp.gmail.com", port: 465, secure: true },
-    { ...shared, host: "smtp.gmail.com", port: 587, secure: false, requireTLS: true },
-  ];
+// ───────────────────────────── Resend (HTTP API) ─────────────────────────
+
+function getResendConfig() {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  if (!apiKey) return null;
+  const from =
+    process.env.RESEND_FROM_EMAIL?.trim() ||
+    // Resend's shared sandbox sender — works out of the box with no domain
+    // verification, but only delivers to the email address you signed up
+    // to Resend with. Verify your own domain in Resend and set
+    // RESEND_FROM_EMAIL once you're ready for production sending.
+    "onboarding@resend.dev";
+  return { apiKey, from };
+}
+
+async function sendViaResend({ apiKey, from }, mail) {
+  if (typeof fetch !== "function") {
+    // Only relevant on Node < 18 without a fetch polyfill installed.
+    const err = new Error(
+      "global fetch is not available in this Node runtime — upgrade to Node 18+ (Render's default images already do)."
+    );
+    throw err;
+  }
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: `Result Generation System <${from}>`,
+      to: [mail.to],
+      subject: mail.subject,
+      text: mail.text,
+      html: mail.html,
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    const err = new Error(
+      `Resend API error (${res.status}): ${data?.message || res.statusText}`
+    );
+    err.status = res.status;
+    err.resendError = data;
+    throw err;
+  }
+
+  return { messageId: data.id };
+}
+
+// ───────────────────────────── Gmail SMTP (fallback) ─────────────────────
+
+// In-memory cache of the resolved IPv4 address for smtp.gmail.com so we
+// don't do a fresh DNS lookup on every single send. Short TTL because
+// Google's frontend IPs are anycast/load-balanced and can change.
+let cachedIPv4 = null; // { address, expiresAt }
+const IPV4_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function resolveIPv4(hostname) {
+  if (cachedIPv4 && cachedIPv4.expiresAt > Date.now()) {
+    return cachedIPv4.address;
+  }
+
+  let address;
+  try {
+    // Pure DNS A-record query — this only talks to the configured DNS
+    // resolver (normally over the container's internal/IPv4 network) and
+    // does not depend on outbound IPv6 routing at all, so it works even
+    // on hosts where IPv6 egress is completely absent.
+    const addresses = await dnsResolve4(hostname);
+    address = addresses[Math.floor(Math.random() * addresses.length)];
+  } catch (_err) {
+    // Fall back to the OS resolver forced to IPv4, in case resolve4()
+    // itself is unavailable in this environment for some reason.
+    const result = await dnsLookup(hostname, { family: 4 });
+    address = result.address;
+  }
+
+  cachedIPv4 = { address, expiresAt: Date.now() + IPV4_CACHE_TTL_MS };
+  return address;
 }
 
 /**
@@ -65,27 +155,106 @@ function buildTransportConfigs(user, pass) {
  *   GMAIL_USER  — the sending Gmail address, e.g. results@yourschoolgroup.com
  *   GMAIL_APP_PASSWORD — the 16-character app password
  */
-function getCredentials() {
+function getGmailCredentials() {
   const user = process.env.GMAIL_USER?.trim();
   // Google's UI displays App Passwords as "abcd efgh ijkl mnop" with spaces
-  // for readability — copy-pasting them verbatim (spaces included) is the
-  // single most common cause of "email isn't sending" in the wild, so we
-  // strip whitespace defensively rather than fail on it.
+  // for readability — copy-pasting them verbatim (spaces included) is a
+  // common cause of "email isn't sending", so we strip whitespace
+  // defensively rather than fail on it.
   const pass = process.env.GMAIL_APP_PASSWORD?.replace(/\s+/g, "");
-
-  if (!user || !pass) {
-    console.warn(
-      "[email] GMAIL_USER / GMAIL_APP_PASSWORD not set — auth code emails will be logged to the console instead of sent. " +
-      "Set both in your .env (see env.example) to actually send mail."
-    );
-    return null;
-  }
+  if (!user || !pass) return null;
   return { user, pass };
 }
 
 /**
- * Sends (or, if SMTP isn't configured, logs) the 6-digit verification code
- * an Admin/School Owner/School Proprietor needs to complete registration.
+ * Two ways to reach Gmail's SMTP, tried in order. 465/SSL is tried first
+ * (fewer round trips), falling back to 587/STARTTLS if the connection
+ * itself fails — some networks/hosts allow one port but not the other.
+ *
+ * `host` is the IPv4 address we resolved ourselves (see resolveIPv4
+ * above) rather than "smtp.gmail.com" — this is what actually forces the
+ * IPv4-only connection, since nodemailer's own `family` option does not
+ * do that reliably (see the big comment at the top of this file).
+ * `servername` is set explicitly to "smtp.gmail.com" so TLS still
+ * validates the certificate against the real hostname instead of the
+ * raw IP.
+ */
+function buildTransportConfigs(user, pass, ipv4Address) {
+  const shared = {
+    host: ipv4Address,
+    servername: "smtp.gmail.com",
+    family: 4, // harmless to keep; belt-and-braces for other nodemailer versions
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 10_000,
+    auth: { user, pass },
+  };
+  return [
+    { ...shared, port: 465, secure: true },
+    { ...shared, port: 587, secure: false, requireTLS: true },
+  ];
+}
+
+async function sendViaGmailSmtp(creds, mail) {
+  let ipv4Address;
+  try {
+    ipv4Address = await resolveIPv4("smtp.gmail.com");
+  } catch (err) {
+    const wrapped = new Error(
+      `Could not resolve smtp.gmail.com to an IPv4 address: ${err.message}`
+    );
+    wrapped.code = err.code;
+    throw wrapped;
+  }
+
+  const configs = buildTransportConfigs(creds.user, creds.pass, ipv4Address);
+
+  let lastErr = null;
+  for (let i = 0; i < configs.length; i++) {
+    const config = configs[i];
+    const tx = nodemailer.createTransport(config);
+    try {
+      const info = await tx.sendMail(mail);
+      console.log(
+        `[email] Sent via Gmail SMTP port ${config.port} (resolved IP ${ipv4Address}, messageId: ${info.messageId})`
+      );
+      return { messageId: info.messageId };
+    } catch (err) {
+      lastErr = err;
+      const isLastConfig = i === configs.length - 1;
+      const willRetry = isConnectionLevelError(err) && !isLastConfig;
+      console.error(
+        `[email] Gmail SMTP send via port ${config.port} (IP ${ipv4Address}) failed: ${err.message}` +
+          (willRetry ? " — retrying on fallback port…" : "")
+      );
+      if (isConnectionLevelError(err)) {
+        // The resolved IP itself might be the problem (e.g. it went stale
+        // or that particular Google frontend IP is unreachable) — drop
+        // the cache so the *next* independent send attempt re-resolves
+        // instead of reusing a possibly-bad address for 5 more minutes.
+        cachedIPv4 = null;
+      }
+      if (!isConnectionLevelError(err)) break; // auth/other errors won't be fixed by switching ports
+    }
+  }
+
+  throw lastErr;
+}
+
+// ───────────────────────────── Public API ─────────────────────────────
+
+/**
+ * Sends (or, if no provider is configured, logs) the 6-digit verification
+ * code an Admin/School Owner/School Proprietor needs to complete
+ * registration.
+ *
+ * Provider selection (checked in this order):
+ *   1. RESEND_API_KEY set            -> send via Resend's HTTP API
+ *   2. GMAIL_USER + GMAIL_APP_PASSWORD set -> send via Gmail SMTP
+ *   3. neither set                   -> log the code to the console (dev mode)
+ *
+ * Set EMAIL_PROVIDER=smtp to force Gmail SMTP even if RESEND_API_KEY is
+ * also set (useful for testing the SMTP path specifically).
  */
 async function sendAdminAuthCodeEmail(toEmail, code) {
   const subject = "Your Result Generation System verification code";
@@ -110,75 +279,63 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
       </p>
     </div>`;
 
-  const creds = getCredentials();
-  if (!creds) {
-    console.log(`[email:dev-mode] Auth code for ${toEmail}: ${code}`);
-    return { devMode: true, sent: false };
-  }
+  const mail = { to: toEmail, subject, text, html };
 
-  const mail = {
-    from: `"Result Generation System" <${creds.user}>`,
-    to: toEmail,
-    subject,
-    text,
-    html,
-  };
+  const forceProvider = process.env.EMAIL_PROVIDER?.trim().toLowerCase();
+  const resendConfig = getResendConfig();
+  const gmailCreds = getGmailCredentials();
 
-  // If a previous send already told us which config works, use it directly
-  // instead of re-probing both ports every time.
-  const configs = workingTransportConfig
-    ? [workingTransportConfig]
-    : buildTransportConfigs(creds.user, creds.pass);
+  const useResend = forceProvider === "resend" || (!forceProvider && !!resendConfig);
+  const useSmtp = forceProvider === "smtp" || (!forceProvider && !resendConfig && !!gmailCreds);
 
-  let lastErr = null;
-  for (let i = 0; i < configs.length; i++) {
-    const config = configs[i];
-    const tx = nodemailer.createTransport(config);
+  if (useResend && resendConfig) {
     try {
-      const info = await tx.sendMail(mail);
-      workingTransportConfig = config; // remember what worked for next time
-      console.log(
-        `[email] Sent auth code to ${toEmail} via port ${config.port} (messageId: ${info.messageId})`
-      );
-      return { devMode: false, sent: true, messageId: info.messageId };
+      const { messageId } = await sendViaResend(resendConfig, mail);
+      console.log(`[email] Sent auth code to ${toEmail} via Resend (id: ${messageId})`);
+      return { devMode: false, sent: true, provider: "resend", messageId };
     } catch (err) {
-      lastErr = err;
-      const isLastConfig = i === configs.length - 1;
-      const willRetry = isConnectionLevelError(err) && !isLastConfig;
-      console.error(
-        `[email] Send via port ${config.port} failed: ${err.message}` +
-          (willRetry ? " — retrying on fallback port…" : "")
-      );
-      if (!isConnectionLevelError(err)) break; // auth/other errors won't be fixed by switching ports
+      console.error(`[email] Resend send to ${toEmail} failed:`, err.message);
+      console.error(`[email] For reference, the code that failed to send was: ${code}`);
+      const wrapped = new Error(`Could not send verification email: ${err.message}`);
+      wrapped.status = err.status && err.status < 500 ? 502 : 502;
+      throw wrapped;
     }
   }
 
-  // Common causes: (1) GMAIL_APP_PASSWORD is your normal password instead
-  // of an App Password, (2) 2-Step Verification isn't enabled on the
-  // account (required before Google will issue App Passwords), (3) the
-  // account has App Passwords disabled by an org admin, or (4) the host
-  // this backend runs on blocks outbound SMTP (465 *and* 587) entirely —
-  // common on some serverless/free-tier platforms — in which case no
-  // credential is ever checked and every attempt times out identically.
-  console.error(`[email] Failed to send to ${toEmail}:`, lastErr.message);
-  console.error(`[email] For reference, the code that failed to send was: ${code}`);
+  if (useSmtp && gmailCreds) {
+    try {
+      const { messageId } = await sendViaGmailSmtp(gmailCreds, mail);
+      console.log(`[email] Sent auth code to ${toEmail} via Gmail SMTP (id: ${messageId})`);
+      return { devMode: false, sent: true, provider: "smtp", messageId };
+    } catch (lastErr) {
+      console.error(`[email] Failed to send to ${toEmail}:`, lastErr.message);
+      console.error(`[email] For reference, the code that failed to send was: ${code}`);
 
-  let hint = "";
-  if (lastErr.responseCode === 535 || /invalid login|username and password/i.test(lastErr.message || "")) {
-    hint =
-      " (Gmail rejected the credentials — confirm GMAIL_APP_PASSWORD is a 16-character App Password from " +
-      "https://myaccount.google.com/apppasswords, generated with 2-Step Verification turned on, not your regular account password.)";
-  } else if (isConnectionLevelError(lastErr)) {
-    hint =
-      " (Could not even open a connection to Gmail on port 465 or 587 — this looks like outbound SMTP is blocked by " +
-      "your hosting provider's network/firewall rather than a credentials problem. Test with " +
-      "`nc -zv smtp.gmail.com 465` and `nc -zv smtp.gmail.com 587` from the server itself; if both hang, move this " +
-      "backend to a host that allows outbound SMTP, or switch to an HTTP-based email API such as Resend/SendGrid/Brevo.)";
+      let hint = "";
+      if (lastErr.responseCode === 535 || /invalid login|username and password/i.test(lastErr.message || "")) {
+        hint =
+          " (Gmail rejected the credentials — confirm GMAIL_APP_PASSWORD is a 16-character App Password from " +
+          "https://myaccount.google.com/apppasswords, generated with 2-Step Verification turned on, not your regular account password.)";
+      } else if (isConnectionLevelError(lastErr)) {
+        hint =
+          " (Could not open a connection to Gmail on port 465 or 587 even over IPv4 — this host's outbound SMTP is " +
+          "genuinely blocked, not just an IPv6 routing issue. Set RESEND_API_KEY (see env.example) to send over HTTPS " +
+          "instead, which does not require outbound SMTP at all.)";
+      }
+
+      const wrapped = new Error(`Could not send verification email: ${lastErr.message}${hint}`);
+      wrapped.status = 502;
+      throw wrapped;
+    }
   }
 
-  const wrapped = new Error(`Could not send verification email: ${lastErr.message}${hint}`);
-  wrapped.status = 502;
-  throw wrapped;
+  // No provider configured — dev mode.
+  console.log(`[email:dev-mode] Auth code for ${toEmail}: ${code}`);
+  console.warn(
+    "[email] Neither RESEND_API_KEY nor GMAIL_USER/GMAIL_APP_PASSWORD are set — auth code emails are only logged " +
+    "to the console. Set RESEND_API_KEY in your .env (recommended, see env.example) to actually send mail."
+  );
+  return { devMode: true, sent: false };
 }
 
 module.exports = { sendAdminAuthCodeEmail };
