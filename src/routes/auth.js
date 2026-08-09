@@ -8,7 +8,7 @@ const { isValidPlan, getTrialLimit } = require("../utils/pricing");
 
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, role: user.role, email: user.email, name: user.name },
+    { id: user.id, role: user.role, email: user.email, name: user.name, schoolId: user.school_id || null },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
   );
@@ -46,6 +46,7 @@ router.post(
     // teachers/parents, not the other way around.
     let authCodeRow = null;
     let paymentRow = null;
+    let newSchoolId = null;
 
     if (role === "admin") {
       const { rows: signupCodes } = await query(
@@ -72,19 +73,19 @@ router.post(
       }
       paymentRow = payments[0];
 
+      // Every paying Admin/School Owner onboards their OWN school — this is a
+      // multi-tenant platform, so this creates a new row in `schools` rather
+      // than overwriting whatever the last admin registered.
       if (!schoolName) return res.status(400).json({ error: "School name is required for admin registration" });
-      const { rows: schools } = await query("SELECT id FROM school_info LIMIT 1");
-      if (schools.length === 0) {
-        await query(
-          `INSERT INTO school_info (name, address, motto, logo_url) VALUES ($1,$2,$3,$4)`,
-          [schoolName, schoolAddress || null, schoolMotto || null, schoolLogo || null]
-        );
-      } else {
-        await query(
-          `UPDATE school_info SET name=$1, address=$2, motto=$3, logo_url=$4 WHERE id=$5`,
-          [schoolName, schoolAddress || null, schoolMotto || null, schoolLogo || null, schools[0].id]
-        );
-      }
+      const { rows: schoolRows } = await query(
+        `INSERT INTO schools (name, address, motto, logo_url) VALUES ($1,$2,$3,$4) RETURNING id`,
+        [schoolName, schoolAddress || null, schoolMotto || null, schoolLogo || null]
+      );
+      newSchoolId = schoolRows[0].id;
+      await query(
+        `INSERT INTO school_info (name, address, motto, logo_url, school_id) VALUES ($1,$2,$3,$4,$5)`,
+        [schoolName, schoolAddress || null, schoolMotto || null, schoolLogo || null, newSchoolId]
+      );
     } else {
       // Teacher / Parent: still go through the Admin-issued auth_codes flow.
       if (!authCode) return res.status(400).json({ error: "Missing required fields" });
@@ -98,20 +99,25 @@ router.post(
         return res.status(400).json({ error: "Authorization code has expired" });
       }
 
-      if (role === "teacher") {
+      if (authCodeRow.school_id) {
+        // Preferred path: the code itself carries the issuing school.
+        newSchoolId = authCodeRow.school_id;
+      } else if (role === "teacher") {
+        // Legacy fallback for codes issued before school scoping existed.
         if (!schoolName) return res.status(400).json({ error: "School name is required for teacher registration" });
-        const { rows: schools } = await query("SELECT name FROM school_info LIMIT 1");
+        const { rows: schools } = await query("SELECT id, name FROM school_info LIMIT 1");
         if (schools.length && schools[0].name.toLowerCase() !== schoolName.trim().toLowerCase()) {
           return res.status(400).json({ error: `School name does not match "${schools[0].name}"` });
         }
+        newSchoolId = schools[0]?.id || null;
       }
     }
 
     const hash = await bcrypt.hash(password, 10);
     const { rows: inserted } = await query(
-      `INSERT INTO users (name, email, password_hash, role, phone, signature_url)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [name, email, hash, role, phone || null, signatureDataUrl || null]
+      `INSERT INTO users (name, email, password_hash, role, phone, signature_url, school_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [name, email, hash, role, phone || null, signatureDataUrl || null, newSchoolId]
     );
     const user = inserted[0];
 
@@ -159,9 +165,18 @@ router.post(
     const { rows } = await query("SELECT * FROM users WHERE email = $1", [email]);
     const user = rows[0];
     if (!user) return res.status(401).json({ error: "No account found with this email address" });
+    if (user.deleted_at) return res.status(403).json({ error: "This account has been removed. Contact your administrator." });
 
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Incorrect password" });
+
+    if (user.school_id && user.role !== "central_admin") {
+      const { rows: schoolRows } = await query("SELECT status, deleted_at FROM schools WHERE id = $1", [user.school_id]);
+      const school = schoolRows[0];
+      if (school && (school.deleted_at || school.status === "suspended")) {
+        return res.status(403).json({ error: "Your school's account has been suspended. Contact the platform administrator." });
+      }
+    }
 
     const token = signToken(user);
     res.json({ token, user: sanitize(user) });

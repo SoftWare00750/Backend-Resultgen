@@ -234,3 +234,118 @@ CREATE TRIGGER trg_subscriptions_updated_at BEFORE UPDATE ON subscriptions
 DROP TRIGGER IF EXISTS trg_payments_updated_at ON payments;
 CREATE TRIGGER trg_payments_updated_at BEFORE UPDATE ON payments
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================
+-- MULTI-TENANCY + CENTRAL ADMIN
+-- Adds a platform-wide `central_admin` role that oversees every school,
+-- a `schools` registry, per-school scoping (school_id) on tenant data,
+-- and soft-delete columns so the Central Admin can remove/hide data from
+-- the platform without hard-purging it (a school's own admin still does a
+-- real, permanent delete via the existing per-resource DELETE routes).
+-- Requires PostgreSQL 12+ (ALTER TYPE ... ADD VALUE IF NOT EXISTS).
+-- ============================================================
+
+ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'central_admin';
+
+DO $$ BEGIN
+  CREATE TYPE school_status AS ENUM ('active', 'suspended');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- ---------- SCHOOLS (tenant registry, owned by Central Admin) ----------
+CREATE TABLE IF NOT EXISTS schools (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name           VARCHAR(255) NOT NULL,
+  address        VARCHAR(500),
+  motto          VARCHAR(255),
+  logo_url       TEXT,
+  contact_email  VARCHAR(255),
+  contact_phone  VARCHAR(20),
+  status         school_status NOT NULL DEFAULT 'active',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at     TIMESTAMPTZ  -- soft-deleted by Central Admin; NULL = active
+);
+CREATE INDEX IF NOT EXISTS idx_schools_deleted_at ON schools(deleted_at);
+
+DROP TRIGGER IF EXISTS trg_schools_updated_at ON schools;
+CREATE TRIGGER trg_schools_updated_at BEFORE UPDATE ON schools
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------- Tenant scoping + soft-delete columns on existing tables ----------
+ALTER TABLE users       ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+ALTER TABLE users       ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE classes     ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+ALTER TABLE classes     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE students    ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+ALTER TABLE students    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE results     ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+ALTER TABLE results     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE sessions    ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+ALTER TABLE school_info ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+ALTER TABLE auth_codes  ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_users_school       ON users(school_id);
+CREATE INDEX IF NOT EXISTS idx_classes_school      ON classes(school_id);
+CREATE INDEX IF NOT EXISTS idx_students_school     ON students(school_id);
+CREATE INDEX IF NOT EXISTS idx_results_school      ON results(school_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_school     ON sessions(school_id);
+CREATE INDEX IF NOT EXISTS idx_users_deleted_at    ON users(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_students_deleted_at ON students(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_results_deleted_at  ON results(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_classes_deleted_at  ON classes(deleted_at);
+
+-- Uniqueness that used to be global now needs to be per-school
+ALTER TABLE classes  DROP CONSTRAINT IF EXISTS classes_name_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_classes_school_name ON classes(school_id, name);
+
+ALTER TABLE students DROP CONSTRAINT IF EXISTS students_admission_number_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_school_admission ON students(school_id, admission_number);
+
+ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_year_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_school_year ON sessions(school_id, year);
+
+DROP INDEX IF EXISTS idx_sessions_one_active;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active_per_school
+  ON sessions (school_id) WHERE is_active = TRUE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_school_info_school ON school_info(school_id);
+
+-- ---------- Backfill: give every pre-existing row a "Legacy School" tenant ----------
+-- Runs once — safe/no-op on a fresh database, and safe to re-run.
+DO $$
+DECLARE
+  legacy_id UUID;
+BEGIN
+  IF EXISTS (SELECT 1 FROM users WHERE school_id IS NULL AND role <> 'central_admin')
+     OR EXISTS (SELECT 1 FROM students WHERE school_id IS NULL)
+  THEN
+    SELECT id INTO legacy_id FROM schools WHERE name = 'Legacy School' LIMIT 1;
+
+    IF legacy_id IS NULL THEN
+      INSERT INTO schools (name, address, motto, logo_url)
+        SELECT COALESCE(name, 'Legacy School'), address, motto, logo_url
+        FROM school_info LIMIT 1
+        RETURNING id INTO legacy_id;
+
+      IF legacy_id IS NULL THEN
+        INSERT INTO schools (name) VALUES ('Legacy School') RETURNING id INTO legacy_id;
+      END IF;
+    END IF;
+
+    UPDATE users       SET school_id = legacy_id WHERE school_id IS NULL AND role <> 'central_admin';
+    UPDATE classes     SET school_id = legacy_id WHERE school_id IS NULL;
+    UPDATE students    SET school_id = legacy_id WHERE school_id IS NULL;
+    UPDATE results     SET school_id = legacy_id WHERE school_id IS NULL;
+    UPDATE sessions    SET school_id = legacy_id WHERE school_id IS NULL;
+    UPDATE school_info SET school_id = legacy_id WHERE school_id IS NULL;
+    UPDATE auth_codes  SET school_id = legacy_id WHERE school_id IS NULL;
+  END IF;
+END $$;
+
+-- ---------- PLATFORM SETTINGS (Central Admin managed, key/value) ----------
+CREATE TABLE IF NOT EXISTS platform_settings (
+  key         VARCHAR(100) PRIMARY KEY,
+  value       JSONB NOT NULL,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by  UUID REFERENCES users(id) ON DELETE SET NULL
+);

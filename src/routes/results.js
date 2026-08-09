@@ -6,24 +6,25 @@ const { calculateGrade } = require("../utils/grading");
 
 router.use(authenticate);
 
-async function recalcPositions(className, term, session, resultType) {
+async function recalcPositions(schoolId, className, term, session, resultType) {
   const { rows } = await query(
     `SELECT id, average_score FROM results
-     WHERE class = $1 AND term = $2 AND session = $3 AND result_type = $4
+     WHERE school_id = $1 AND class = $2 AND term = $3 AND session = $4 AND result_type = $5
+       AND deleted_at IS NULL
      ORDER BY average_score DESC NULLS LAST`,
-    [className, term, session, resultType]
+    [schoolId, className, term, session, resultType]
   );
   for (let i = 0; i < rows.length; i++) {
     await query("UPDATE results SET position = $1 WHERE id = $2", [i + 1, rows[i].id]);
   }
 }
 
-// GET /api/results (?studentId=, ?class=, ?term=, ?session=, ?publishedOnly=true) — scoped by role
+// GET /api/results (?studentId=, ?class=, ?term=, ?session=, ?publishedOnly=true) — scoped by role + school
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const conditions = [];
-    const params = [];
+    const conditions = ["school_id = $1", "deleted_at IS NULL"];
+    const params = [req.user.schoolId];
 
     if (req.user.role === "teacher") {
       params.push(req.user.id);
@@ -31,7 +32,6 @@ router.get(
     }
 
     if (req.user.role === "parent") {
-      // Restrict to results for students belonging to this parent
       conditions.push(
         `student_id IN (SELECT id FROM students WHERE parent_id = $${params.length + 1})`
       );
@@ -59,8 +59,10 @@ router.get(
       conditions.push("published = TRUE");
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const { rows } = await query(`SELECT * FROM results ${where} ORDER BY created_at DESC`, params);
+    const { rows } = await query(
+      `SELECT * FROM results WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC`,
+      params
+    );
     res.json(rows);
   })
 );
@@ -89,8 +91,8 @@ router.post(
       `INSERT INTO results
         (student_id, student_name, admission_number, class, term, session, result_type,
          subjects, total_score, average_score, overall_grade, teacher_comment, principal_comment,
-         published, attendance, affective_domain, psychomotor_skills, house, club, age, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,$14,$15,$16,$17,$18,$19,$20)
+         published, attendance, affective_domain, psychomotor_skills, house, club, age, created_by, school_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,$14,$15,$16,$17,$18,$19,$20,$21)
        RETURNING *`,
       [
         studentId, studentName, admissionNumber, className, term, session, resultType,
@@ -98,11 +100,11 @@ router.post(
         teacherComment || null, principalComment || null,
         JSON.stringify(attendance || { opened: 0, present: 0, absent: 0 }),
         JSON.stringify(affectiveDomain || {}), JSON.stringify(psychomotorSkills || {}),
-        house || null, club || null, age || null, req.user.id,
+        house || null, club || null, age || null, req.user.id, req.user.schoolId,
       ]
     );
 
-    await recalcPositions(className, term, session, resultType);
+    await recalcPositions(req.user.schoolId, className, term, session, resultType);
     const { rows: finalRow } = await query("SELECT * FROM results WHERE id = $1", [rows[0].id]);
     res.status(201).json(finalRow[0]);
   })
@@ -113,7 +115,10 @@ router.patch(
   "/:id",
   requireRole("admin", "teacher"),
   asyncHandler(async (req, res) => {
-    const { rows: existingRows } = await query("SELECT * FROM results WHERE id = $1", [req.params.id]);
+    const { rows: existingRows } = await query(
+      "SELECT * FROM results WHERE id = $1 AND school_id = $2",
+      [req.params.id, req.user.schoolId]
+    );
     const existing = existingRows[0];
     if (!existing) return res.status(404).json({ error: "Result not found" });
 
@@ -158,7 +163,7 @@ router.patch(
     );
 
     if (subjects) {
-      await recalcPositions(existing.class, existing.term, existing.session, existing.result_type);
+      await recalcPositions(req.user.schoolId, existing.class, existing.term, existing.session, existing.result_type);
       const { rows: refreshed } = await query("SELECT * FROM results WHERE id = $1", [req.params.id]);
       return res.json(refreshed[0]);
     }
@@ -166,12 +171,16 @@ router.patch(
   })
 );
 
-// DELETE /api/results/:id
+// DELETE /api/results/:id — real, permanent delete by the school's own admin/teacher
 router.delete(
   "/:id",
   requireRole("admin", "teacher"),
   asyncHandler(async (req, res) => {
-    await query("DELETE FROM results WHERE id = $1", [req.params.id]);
+    const { rows } = await query(
+      "DELETE FROM results WHERE id = $1 AND school_id = $2 RETURNING id",
+      [req.params.id, req.user.schoolId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Result not found" });
     res.status(204).send();
   })
 );

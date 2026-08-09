@@ -13,7 +13,10 @@ function generateSixDigitCode() {
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { rows } = await query("SELECT * FROM auth_codes ORDER BY created_at DESC");
+    const { rows } = await query(
+      "SELECT * FROM auth_codes WHERE school_id = $1 ORDER BY created_at DESC",
+      [req.user.schoolId]
+    );
     res.json(rows);
   })
 );
@@ -31,9 +34,9 @@ router.post(
     expiresAt.setDate(expiresAt.getDate() + 7);
 
     const { rows } = await query(
-      `INSERT INTO auth_codes (code, role, expires_at, created_by)
-       VALUES ($1,$2,$3,$4) RETURNING *`,
-      [code, role, expiresAt.toISOString(), req.user.id]
+      `INSERT INTO auth_codes (code, role, expires_at, created_by, school_id)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [code, role, expiresAt.toISOString(), req.user.id, req.user.schoolId]
     );
     res.status(201).json(rows[0]);
   })
@@ -43,7 +46,11 @@ router.post(
 router.delete(
   "/:id",
   asyncHandler(async (req, res) => {
-    await query("DELETE FROM auth_codes WHERE id = $1", [req.params.id]);
+    const { rows } = await query(
+      "DELETE FROM auth_codes WHERE id = $1 AND school_id = $2 RETURNING id",
+      [req.params.id, req.user.schoolId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Auth code not found" });
     res.status(204).send();
   })
 );

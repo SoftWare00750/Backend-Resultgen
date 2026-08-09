@@ -10,14 +10,16 @@ router.use(authenticate);
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    let sql = "SELECT * FROM classes";
-    const params = [];
+    const conditions = ["school_id = $1", "deleted_at IS NULL"];
+    const params = [req.user.schoolId];
     if (req.user.role === "teacher") {
-      sql += " WHERE assigned_teacher_id = $1";
       params.push(req.user.id);
+      conditions.push(`assigned_teacher_id = $${params.length}`);
     }
-    sql += " ORDER BY name";
-    const { rows } = await query(sql, params);
+    const { rows } = await query(
+      `SELECT * FROM classes WHERE ${conditions.join(" AND ")} ORDER BY name`,
+      params
+    );
     res.json(rows);
   })
 );
@@ -33,9 +35,9 @@ router.post(
     const finalSubjects = subjects && subjects.length ? subjects : getSubjectsByCategory(name);
     try {
       const { rows } = await query(
-        `INSERT INTO classes (name, category, assigned_teacher_id, subjects)
-         VALUES ($1,$2,$3,$4) RETURNING *`,
-        [name, category, assignedTeacherId || null, JSON.stringify(finalSubjects)]
+        `INSERT INTO classes (name, category, assigned_teacher_id, subjects, school_id)
+         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        [name, category, assignedTeacherId || null, JSON.stringify(finalSubjects), req.user.schoolId]
       );
       res.status(201).json(rows[0]);
     } catch (err) {
@@ -55,8 +57,8 @@ router.patch(
       `UPDATE classes SET
          assigned_teacher_id = COALESCE($1, assigned_teacher_id),
          subjects = COALESCE($2, subjects)
-       WHERE id = $3 RETURNING *`,
-      [assignedTeacherId, subjects ? JSON.stringify(subjects) : null, req.params.id]
+       WHERE id = $3 AND school_id = $4 RETURNING *`,
+      [assignedTeacherId, subjects ? JSON.stringify(subjects) : null, req.params.id, req.user.schoolId]
     );
     if (!rows[0]) return res.status(404).json({ error: "Class not found" });
     res.json(rows[0]);
@@ -68,7 +70,11 @@ router.delete(
   "/:id",
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    await query("DELETE FROM classes WHERE id = $1", [req.params.id]);
+    const { rows } = await query(
+      "DELETE FROM classes WHERE id = $1 AND school_id = $2 RETURNING id",
+      [req.params.id, req.user.schoolId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Class not found" });
     res.status(204).send();
   })
 );

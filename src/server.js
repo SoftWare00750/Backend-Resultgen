@@ -12,6 +12,7 @@ const sessionRoutes = require("./routes/sessions");
 const schoolRoutes = require("./routes/school");
 const adminSignupRoutes = require("./routes/adminSignup");
 const paymentRoutes = require("./routes/payments");
+const centralAdminRoutes = require("./routes/centralAdmin");
 
 const app = express();
 
@@ -62,7 +63,7 @@ app.get("/", (req, res) => {
     message: "RGS API is running",
     version: "1.0.0",
     endpoints:
-      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school, /api/admin-signup, /api/payments",
+      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school, /api/admin-signup, /api/payments, /api/central",
   });
 });
 
@@ -80,6 +81,7 @@ app.use("/api/sessions", sessionRoutes);
 app.use("/api/school", schoolRoutes);
 app.use("/api/admin-signup", adminSignupRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/central", centralAdminRoutes);
 
 // 404 handler
 app.use((req, res) => res.status(404).json({ error: "Not found" }));

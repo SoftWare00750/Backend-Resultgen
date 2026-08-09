@@ -5,16 +5,16 @@ const { authenticate, requireRole } = require("../middleware/auth");
 
 router.use(authenticate);
 
-// GET /api/school
+// GET /api/school — this user's own school branding info
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { rows } = await query("SELECT * FROM school_info LIMIT 1");
+    const { rows } = await query("SELECT * FROM school_info WHERE school_id = $1", [req.user.schoolId]);
     res.json(rows[0] || null);
   })
 );
 
-// PUT /api/school (admin only) — upsert single row
+// PUT /api/school (admin only) — upsert this school's single info row
 router.put(
   "/",
   requireRole("admin"),
@@ -22,11 +22,11 @@ router.put(
     const { name, address, motto, logoUrl } = req.body;
     if (!name) return res.status(400).json({ error: "School name is required" });
 
-    const { rows: existing } = await query("SELECT id FROM school_info LIMIT 1");
+    const { rows: existing } = await query("SELECT id FROM school_info WHERE school_id = $1", [req.user.schoolId]);
     if (existing.length === 0) {
       const { rows } = await query(
-        `INSERT INTO school_info (name, address, motto, logo_url) VALUES ($1,$2,$3,$4) RETURNING *`,
-        [name, address || null, motto || null, logoUrl || null]
+        `INSERT INTO school_info (name, address, motto, logo_url, school_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        [name, address || null, motto || null, logoUrl || null, req.user.schoolId]
       );
       return res.status(201).json(rows[0]);
     }

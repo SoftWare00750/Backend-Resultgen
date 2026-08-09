@@ -5,12 +5,12 @@ const { authenticate, requireRole } = require("../middleware/auth");
 
 router.use(authenticate);
 
-// GET /api/students  (?class=, ?parentId=) — scoped by role
+// GET /api/students  (?class=, ?parentId=) — scoped by role and school
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const conditions = [];
-    const params = [];
+    const conditions = ["school_id = $1", "deleted_at IS NULL"];
+    const params = [req.user.schoolId];
 
     if (req.user.role === "parent") {
       params.push(req.user.id);
@@ -25,8 +25,10 @@ router.get(
       conditions.push(`class = $${params.length}`);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const { rows } = await query(`SELECT * FROM students ${where} ORDER BY name`, params);
+    const { rows } = await query(
+      `SELECT * FROM students WHERE ${conditions.join(" AND ")} ORDER BY name`,
+      params
+    );
     res.json(rows);
   })
 );
@@ -35,9 +37,10 @@ router.get(
 router.get(
   "/check-admission/:admissionNumber",
   asyncHandler(async (req, res) => {
-    const { rows } = await query("SELECT id FROM students WHERE admission_number = $1", [
-      req.params.admissionNumber,
-    ]);
+    const { rows } = await query(
+      "SELECT id FROM students WHERE admission_number = $1 AND school_id = $2",
+      [req.params.admissionNumber, req.user.schoolId]
+    );
     res.json({ exists: rows.length > 0 });
   })
 );
@@ -61,10 +64,11 @@ router.post(
     try {
       const { rows } = await query(
         `INSERT INTO students
-          (name, admission_number, class, parent_id, date_of_birth, gender, guardian_name, guardian_phone, address, photo_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          (name, admission_number, class, parent_id, date_of_birth, gender, guardian_name, guardian_phone, address, photo_url, school_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
         [name, admissionNumber, className, finalParentId || null, dateOfBirth || null,
-         gender || null, guardianName || null, guardianPhone || null, address || null, photoUrl || null]
+         gender || null, guardianName || null, guardianPhone || null, address || null, photoUrl || null,
+         req.user.schoolId]
       );
       res.status(201).json(rows[0]);
     } catch (err) {
@@ -93,19 +97,24 @@ router.patch(
          guardian_phone = COALESCE($6, guardian_phone),
          address = COALESCE($7, address),
          photo_url = COALESCE($8, photo_url)
-       WHERE id = $9 RETURNING *`,
-      [name, className, dateOfBirth, gender, guardianName, guardianPhone, address, photoUrl, req.params.id]
+       WHERE id = $9 AND school_id = $10 RETURNING *`,
+      [name, className, dateOfBirth, gender, guardianName, guardianPhone, address, photoUrl,
+       req.params.id, req.user.schoolId]
     );
     if (!rows[0]) return res.status(404).json({ error: "Student not found" });
     res.json(rows[0]);
   })
 );
 
-// DELETE /api/students/:id
+// DELETE /api/students/:id — real, permanent delete by the school's own admin/teacher
 router.delete(
   "/:id",
   asyncHandler(async (req, res) => {
-    await query("DELETE FROM students WHERE id = $1", [req.params.id]);
+    const { rows } = await query(
+      "DELETE FROM students WHERE id = $1 AND school_id = $2 RETURNING id",
+      [req.params.id, req.user.schoolId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Student not found" });
     res.status(204).send();
   })
 );
