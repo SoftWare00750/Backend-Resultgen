@@ -2,6 +2,7 @@ const router = require("express").Router();
 const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { authenticate, requireRole } = require("../middleware/auth");
+const overflow = require("../utils/dbOverflow");
 
 router.use(authenticate);
 
@@ -29,7 +30,28 @@ router.get(
       `SELECT * FROM students WHERE ${conditions.join(" AND ")} ORDER BY name`,
       params
     );
-    res.json(rows);
+
+    // Merge in students written to the Sheets overflow store while
+    // Postgres was full. Best-effort — Sheets being unreachable shouldn't
+    // break normal reads.
+    let combined = rows;
+    if (overflow.isConfigured()) {
+      try {
+        const overflowRows = await overflow.students.list(req.user.schoolId, (r) => {
+          if (req.user.role === "parent" && r.parent_id !== req.user.id) return false;
+          if (req.query.parentId && r.parent_id !== req.query.parentId) return false;
+          if (req.query.class && r.class !== req.query.class) return false;
+          return true;
+        });
+        combined = [...rows, ...overflowRows].sort((a, b) =>
+          String(a.name).localeCompare(String(b.name))
+        );
+      } catch (err) {
+        console.error("Google Sheets overflow read failed (showing DB students only):", err.message);
+      }
+    }
+
+    res.json(combined);
   })
 );
 
@@ -73,6 +95,20 @@ router.post(
       res.status(201).json(rows[0]);
     } catch (err) {
       if (err.code === "23505") return res.status(409).json({ error: "Admission number already exists" });
+
+      if (overflow.isStorageFullError(err) && overflow.isConfigured()) {
+        console.warn(
+          `⚠ Postgres is out of storage — writing student "${name}" to the Google Sheets overflow store instead.`
+        );
+        const fallbackRow = await overflow.students.create({
+          name, admission_number: admissionNumber, class: className,
+          parent_id: finalParentId || null, date_of_birth: dateOfBirth || null,
+          gender: gender || null, guardian_name: guardianName || null,
+          guardian_phone: guardianPhone || null, address: address || null,
+          photo_url: photoUrl || null, school_id: req.user.schoolId,
+        });
+        return res.status(201).json(fallbackRow);
+      }
       throw err;
     }
   })
@@ -101,8 +137,26 @@ router.patch(
       [name, className, dateOfBirth, gender, guardianName, guardianPhone, address, photoUrl,
        req.params.id, req.user.schoolId]
     );
-    if (!rows[0]) return res.status(404).json({ error: "Student not found" });
-    res.json(rows[0]);
+    if (rows[0]) return res.json(rows[0]);
+
+    if (overflow.isConfigured()) {
+      const existing = await overflow.students.findById(req.params.id);
+      if (existing && existing.school_id === req.user.schoolId) {
+        const updated = await overflow.students.update(req.params.id, {
+          name: name !== undefined ? name : existing.name,
+          class: className !== undefined ? className : existing.class,
+          date_of_birth: dateOfBirth !== undefined ? dateOfBirth : existing.date_of_birth,
+          gender: gender !== undefined ? gender : existing.gender,
+          guardian_name: guardianName !== undefined ? guardianName : existing.guardian_name,
+          guardian_phone: guardianPhone !== undefined ? guardianPhone : existing.guardian_phone,
+          address: address !== undefined ? address : existing.address,
+          photo_url: photoUrl !== undefined ? photoUrl : existing.photo_url,
+        });
+        return res.json(updated);
+      }
+    }
+
+    res.status(404).json({ error: "Student not found" });
   })
 );
 
@@ -114,8 +168,17 @@ router.delete(
       "DELETE FROM students WHERE id = $1 AND school_id = $2 RETURNING id",
       [req.params.id, req.user.schoolId]
     );
-    if (!rows[0]) return res.status(404).json({ error: "Student not found" });
-    res.status(204).send();
+    if (rows[0]) return res.status(204).send();
+
+    if (overflow.isConfigured()) {
+      const existing = await overflow.students.findById(req.params.id);
+      if (existing && existing.school_id === req.user.schoolId) {
+        await overflow.students.remove(req.params.id);
+        return res.status(204).send();
+      }
+    }
+
+    res.status(404).json({ error: "Student not found" });
   })
 );
 

@@ -97,11 +97,15 @@ const PORT = process.env.PORT || 4000;
 function logIntegrationStatus() {
   const gmailReady = !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
   const paystackReady = !!(process.env.PAYSTACK_SECRET_KEY && process.env.PAYSTACK_PUBLIC_KEY);
+  const sheetsOverflowReady = require("./utils/dbOverflow").isConfigured();
   console.log(
     `📧 Gmail (admin auth-code emails): ${gmailReady ? "configured" : "NOT configured — codes will only be logged to this console"}`
   );
   console.log(
     `💳 Paystack (payments): ${paystackReady ? "configured" : "NOT configured — /api/payments/initialize will return an error until PAYSTACK_SECRET_KEY / PAYSTACK_PUBLIC_KEY are set"}`
+  );
+  console.log(
+    `📊 Google Sheets overflow store: ${sheetsOverflowReady ? "configured — results/students will fail over to Sheets if Postgres runs out of storage" : "NOT configured — writes will simply error if Postgres runs out of storage"}`
   );
 }
 

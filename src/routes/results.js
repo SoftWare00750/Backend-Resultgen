@@ -3,6 +3,7 @@ const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { authenticate, requireRole } = require("../middleware/auth");
 const { calculateGrade } = require("../utils/grading");
+const overflow = require("../utils/dbOverflow");
 
 router.use(authenticate);
 
@@ -63,7 +64,33 @@ router.get(
       `SELECT * FROM results WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC`,
       params
     );
-    res.json(rows);
+
+    // Merge in anything that got written to the Google Sheets overflow
+    // store while Postgres was full, so it doesn't just disappear from
+    // view. Best-effort: if Sheets is unreachable, fall back to DB-only
+    // results rather than failing the whole request.
+    let combined = rows;
+    if (overflow.isConfigured()) {
+      try {
+        const overflowRows = await overflow.results.list(req.user.schoolId, (r) => {
+          if (req.user.role === "teacher" && r.created_by !== req.user.id) return false;
+          if (req.user.role === "parent" && !r.published) return false;
+          if (req.query.studentId && r.student_id !== req.query.studentId) return false;
+          if (req.query.class && r.class !== req.query.class) return false;
+          if (req.query.term && r.term !== req.query.term) return false;
+          if (req.query.session && r.session !== req.query.session) return false;
+          if (req.query.publishedOnly === "true" && !r.published) return false;
+          return true;
+        });
+        combined = [...overflowRows, ...rows].sort(
+          (a, b) => new Date(b.created_at) - new Date(a.created_at)
+        );
+      } catch (err) {
+        console.error("Google Sheets overflow read failed (showing DB results only):", err.message);
+      }
+    }
+
+    res.json(combined);
   })
 );
 
@@ -86,26 +113,68 @@ router.post(
     const totalScore = subjects.reduce((sum, s) => sum + (Number(s.score) || 0), 0);
     const averageScore = subjects.length ? totalScore / subjects.length : 0;
     const { grade } = calculateGrade(averageScore);
+    const attendanceData = attendance || { opened: 0, present: 0, absent: 0 };
 
-    const { rows } = await query(
-      `INSERT INTO results
-        (student_id, student_name, admission_number, class, term, session, result_type,
-         subjects, total_score, average_score, overall_grade, teacher_comment, principal_comment,
-         published, attendance, affective_domain, psychomotor_skills, house, club, age, created_by, school_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,$14,$15,$16,$17,$18,$19,$20,$21)
-       RETURNING *`,
-      [
-        studentId, studentName, admissionNumber, className, term, session, resultType,
-        JSON.stringify(subjects), totalScore, averageScore.toFixed(2), grade,
-        teacherComment || null, principalComment || null,
-        JSON.stringify(attendance || { opened: 0, present: 0, absent: 0 }),
-        JSON.stringify(affectiveDomain || {}), JSON.stringify(psychomotorSkills || {}),
-        house || null, club || null, age || null, req.user.id, req.user.schoolId,
-      ]
-    );
+    let insertedId;
+    try {
+      const { rows } = await query(
+        `INSERT INTO results
+          (student_id, student_name, admission_number, class, term, session, result_type,
+           subjects, total_score, average_score, overall_grade, teacher_comment, principal_comment,
+           published, attendance, affective_domain, psychomotor_skills, house, club, age, created_by, school_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,$14,$15,$16,$17,$18,$19,$20,$21)
+         RETURNING *`,
+        [
+          studentId, studentName, admissionNumber, className, term, session, resultType,
+          JSON.stringify(subjects), totalScore, averageScore.toFixed(2), grade,
+          teacherComment || null, principalComment || null,
+          JSON.stringify(attendanceData),
+          JSON.stringify(affectiveDomain || {}), JSON.stringify(psychomotorSkills || {}),
+          house || null, club || null, age || null, req.user.id, req.user.schoolId,
+        ]
+      );
+      insertedId = rows[0].id;
+    } catch (err) {
+      if (!overflow.isStorageFullError(err)) throw err;
+      if (!overflow.isConfigured()) {
+        console.error("Postgres is full and Google Sheets overflow is not configured:", err.message);
+        throw err;
+      }
+
+      console.warn(
+        `⚠ Postgres is out of storage — writing result for student ${studentId} to the ` +
+          "Google Sheets overflow store instead."
+      );
+      const fallbackRow = await overflow.results.create({
+        student_id: studentId,
+        student_name: studentName,
+        admission_number: admissionNumber,
+        class: className,
+        term,
+        session,
+        result_type: resultType,
+        subjects,
+        total_score: totalScore,
+        average_score: averageScore.toFixed(2),
+        overall_grade: grade,
+        position: null,
+        teacher_comment: teacherComment || null,
+        principal_comment: principalComment || null,
+        published: false,
+        attendance: attendanceData,
+        affective_domain: affectiveDomain || {},
+        psychomotor_skills: psychomotorSkills || {},
+        house: house || null,
+        club: club || null,
+        age: age || null,
+        created_by: req.user.id,
+        school_id: req.user.schoolId,
+      });
+      return res.status(201).json(fallbackRow);
+    }
 
     await recalcPositions(req.user.schoolId, className, term, session, resultType);
-    const { rows: finalRow } = await query("SELECT * FROM results WHERE id = $1", [rows[0].id]);
+    const { rows: finalRow } = await query("SELECT * FROM results WHERE id = $1", [insertedId]);
     res.status(201).json(finalRow[0]);
   })
 );
@@ -119,11 +188,49 @@ router.patch(
       "SELECT * FROM results WHERE id = $1 AND school_id = $2",
       [req.params.id, req.user.schoolId]
     );
-    const existing = existingRows[0];
+    let existing = existingRows[0];
+
+    // Not in Postgres — check whether it was written to the Sheets overflow
+    // store instead (i.e. it was created while the DB was full).
+    let isOverflowRow = false;
+    if (!existing && overflow.isConfigured()) {
+      const overflowExisting = await overflow.results.findById(req.params.id);
+      if (overflowExisting && overflowExisting.school_id === req.user.schoolId) {
+        existing = overflowExisting;
+        isOverflowRow = true;
+      }
+    }
     if (!existing) return res.status(404).json({ error: "Result not found" });
 
     const { subjects, teacherComment, principalComment, published,
             attendance, affectiveDomain, psychomotorSkills, house, club, age } = req.body;
+
+    if (isOverflowRow) {
+      let totalScore = existing.total_score;
+      let averageScore = existing.average_score;
+      let overallGrade = existing.overall_grade;
+      if (subjects) {
+        totalScore = subjects.reduce((sum, s) => sum + (Number(s.score) || 0), 0);
+        averageScore = subjects.length ? (totalScore / subjects.length).toFixed(2) : "0.00";
+        overallGrade = calculateGrade(Number(averageScore)).grade;
+      }
+      const updated = await overflow.results.update(req.params.id, {
+        subjects: subjects || existing.subjects,
+        total_score: totalScore,
+        average_score: averageScore,
+        overall_grade: overallGrade,
+        teacher_comment: teacherComment !== undefined ? teacherComment : existing.teacher_comment,
+        principal_comment: principalComment !== undefined ? principalComment : existing.principal_comment,
+        published: published !== undefined ? published : existing.published,
+        attendance: attendance || existing.attendance,
+        affective_domain: affectiveDomain || existing.affective_domain,
+        psychomotor_skills: psychomotorSkills || existing.psychomotor_skills,
+        house: house !== undefined ? house : existing.house,
+        club: club !== undefined ? club : existing.club,
+        age: age !== undefined ? age : existing.age,
+      });
+      return res.json(updated);
+    }
 
     let totalScore = existing.total_score;
     let averageScore = existing.average_score;
@@ -180,8 +287,17 @@ router.delete(
       "DELETE FROM results WHERE id = $1 AND school_id = $2 RETURNING id",
       [req.params.id, req.user.schoolId]
     );
-    if (!rows[0]) return res.status(404).json({ error: "Result not found" });
-    res.status(204).send();
+    if (rows[0]) return res.status(204).send();
+
+    if (overflow.isConfigured()) {
+      const existing = await overflow.results.findById(req.params.id);
+      if (existing && existing.school_id === req.user.schoolId) {
+        await overflow.results.remove(req.params.id);
+        return res.status(204).send();
+      }
+    }
+
+    res.status(404).json({ error: "Result not found" });
   })
 );
 
