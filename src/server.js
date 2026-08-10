@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const { runMigrations } = require("./db/migrate");
 
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/users");
@@ -121,7 +122,28 @@ function logIntegrationStatus() {
 //    running Node.js with --use-system-ca"
 // which is exactly the error blocking login/register for every portal.
 // Removing the self-signed HTTPS branch removes the failure mode entirely.
-app.listen(PORT, () => {
-  console.log(`🚀 RGS backend listening on http://localhost:${PORT}`);
-  logIntegrationStatus();
-});
+// Apply schema.sql on every boot before accepting traffic. schema.sql is
+// fully idempotent (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS everywhere), so
+// this is safe to run against a database that's already up to date, and it
+// guarantees the running code and the live schema can never drift apart —
+// which is what caused `relation "schools" does not exist`: schema.sql had
+// been updated to add multi-tenancy (the `schools` table) but that change
+// was never applied to the deployed database because `npm run migrate` is a
+// separate manual step that's easy to forget after a deploy.
+async function start() {
+  try {
+    console.log("Running database migrations...");
+    await runMigrations();
+    console.log("✅ Database schema is up to date.");
+  } catch (err) {
+    console.error("❌ Database migration failed on boot:", err.message);
+    process.exit(1);
+  }
+
+  app.listen(PORT, () => {
+    console.log(`🚀 RGS backend listening on http://localhost:${PORT}`);
+    logIntegrationStatus();
+  });
+}
+
+start();
