@@ -5,6 +5,7 @@ const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { authenticate } = require("../middleware/auth");
 const { isValidPlan, getTrialLimit } = require("../utils/pricing");
+const { normalizeEmail } = require("../utils/normalizeEmail");
 
 function signToken(user) {
   return jwt.sign(
@@ -24,18 +25,22 @@ router.post(
   "/register",
   asyncHandler(async (req, res) => {
     const {
-      name, email, password, role, authCode, phone,
+      name, email: rawEmail, password, role, authCode, phone,
       schoolName, schoolLogo, schoolAddress, schoolMotto, signatureDataUrl,
       // Admin/School Owner/School Proprietor-only fields:
       plan, paymentReference, studentCount,
     } = req.body;
 
-    if (!name || !email || !password || !role) {
+    if (!name || !rawEmail || !password || !role) {
       return res.status(400).json({ error: "Missing required fields" });
     }
     if (!["admin", "teacher", "parent"].includes(role)) {
       return res.status(400).json({ error: "Invalid role" });
     }
+
+    // Normalize once so lookups, the signup-code match, and the stored row
+    // are all consistent regardless of how the person typed their email.
+    const email = normalizeEmail(rawEmail);
 
     const { rows: existingUsers } = await query("SELECT id FROM users WHERE email = $1", [email]);
     if (existingUsers.length) return res.status(409).json({ error: "An account with this email already exists" });
@@ -159,8 +164,9 @@ router.post(
 router.post(
   "/login",
   asyncHandler(async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+    const { email: rawEmail, password } = req.body;
+    if (!rawEmail || !password) return res.status(400).json({ error: "Email and password are required" });
+    const email = normalizeEmail(rawEmail);
 
     const { rows } = await query("SELECT * FROM users WHERE email = $1", [email]);
     const user = rows[0];

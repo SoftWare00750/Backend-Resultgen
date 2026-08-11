@@ -2,6 +2,7 @@ const router = require("express").Router();
 const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { sendAdminAuthCodeEmail } = require("../utils/email");
+const { normalizeEmail } = require("../utils/normalizeEmail");
 
 const RESEND_COOLDOWN_SECONDS = Number(process.env.ADMIN_CODE_RESEND_COOLDOWN_SECONDS || 30);
 const CODE_EXPIRY_MINUTES = 10;
@@ -19,8 +20,9 @@ function generateSixDigitCode() {
 router.post(
   "/request-code",
   asyncHandler(async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email is required" });
+    const { email: rawEmail } = req.body;
+    if (!rawEmail) return res.status(400).json({ error: "Email is required" });
+    const email = normalizeEmail(rawEmail);
 
     const { rows: existingUsers } = await query("SELECT id FROM users WHERE email = $1", [email]);
     if (existingUsers.length) {
@@ -82,8 +84,9 @@ router.post(
 router.post(
   "/verify-code",
   asyncHandler(async (req, res) => {
-    const { email, code } = req.body;
-    if (!email || !code) return res.status(400).json({ error: "Email and code are required" });
+    const { email: rawEmail, code } = req.body;
+    if (!rawEmail || !code) return res.status(400).json({ error: "Email and code are required" });
+    const email = normalizeEmail(rawEmail);
 
     const { rows } = await query("SELECT * FROM admin_signup_codes WHERE email = $1", [email]);
     const record = rows[0];

@@ -2,6 +2,7 @@ const router = require("express").Router();
 const bcrypt = require("bcryptjs");
 const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
+const { normalizeEmail } = require("../utils/normalizeEmail");
 const { authenticate, requireRole } = require("../middleware/auth");
 
 // Every route here is Central Admin only.
@@ -138,13 +139,14 @@ router.post(
 
     let admin = null;
     if (adminEmail && adminPassword) {
-      const { rows: existing } = await query("SELECT id FROM users WHERE email = $1", [adminEmail]);
+      const normalizedAdminEmail = normalizeEmail(adminEmail);
+      const { rows: existing } = await query("SELECT id FROM users WHERE email = $1", [normalizedAdminEmail]);
       if (existing.length) return res.status(409).json({ error: "An account with this admin email already exists" });
       const hash = await bcrypt.hash(adminPassword, 10);
       const { rows: adminRows } = await query(
         `INSERT INTO users (name, email, password_hash, role, school_id)
          VALUES ($1,$2,$3,'admin',$4) RETURNING *`,
-        [adminName || "School Admin", adminEmail, hash, school.id]
+        [adminName || "School Admin", normalizedAdminEmail, hash, school.id]
       );
       admin = sanitize(adminRows[0]);
     }
@@ -247,10 +249,11 @@ router.patch(
 router.post(
   "/schools/:id/admins",
   asyncHandler(async (req, res) => {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
+    const { name, email: rawEmail, password } = req.body;
+    if (!name || !rawEmail || !password) {
       return res.status(400).json({ error: "name, email and password are required" });
     }
+    const email = normalizeEmail(rawEmail);
     const { rows: school } = await query("SELECT id FROM schools WHERE id = $1 AND deleted_at IS NULL", [req.params.id]);
     if (!school.length) return res.status(404).json({ error: "School not found" });
 
@@ -324,10 +327,11 @@ router.patch(
 router.post(
   "/central-admins",
   asyncHandler(async (req, res) => {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
+    const { name, email: rawEmail, password } = req.body;
+    if (!name || !rawEmail || !password) {
       return res.status(400).json({ error: "name, email and password are required" });
     }
+    const email = normalizeEmail(rawEmail);
     const { rows: existing } = await query("SELECT id FROM users WHERE email = $1", [email]);
     if (existing.length) return res.status(409).json({ error: "An account with this email already exists" });
 

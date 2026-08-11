@@ -294,6 +294,37 @@ CREATE INDEX IF NOT EXISTS idx_students_deleted_at ON students(deleted_at);
 CREATE INDEX IF NOT EXISTS idx_results_deleted_at  ON results(deleted_at);
 CREATE INDEX IF NOT EXISTS idx_classes_deleted_at  ON classes(deleted_at);
 
+-- `email` above only has a case-SENSITIVE UNIQUE constraint, but every route
+-- now normalizes email to lowercase before reading/writing it (see
+-- src/utils/normalizeEmail.js) — this backfills any rows that predate that
+-- fix and adds a case-insensitive unique index as a defense-in-depth
+-- backstop, so a duplicate-by-casing account (e.g. "Admin@x.com" vs
+-- "admin@x.com") can never be created even if some future code path forgets
+-- to normalize.
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  -- Row-by-row (not a single bulk UPDATE) so that if two existing rows
+  -- happen to collide once lowercased (e.g. "Admin@x.com" and "admin@x.com"
+  -- both already exist as separate accounts), we skip and warn about just
+  -- that pair instead of the whole migration failing on a unique_violation.
+  FOR r IN SELECT id, email FROM users WHERE email <> LOWER(email) LOOP
+    BEGIN
+      UPDATE users SET email = LOWER(r.email) WHERE id = r.id;
+    EXCEPTION WHEN unique_violation THEN
+      RAISE NOTICE 'Skipped lowercasing email for user %: an account with % already exists — resolve this pair manually.', r.id, LOWER(r.email);
+    END;
+  END LOOP;
+END $$;
+
+DO $$ BEGIN
+  CREATE UNIQUE INDEX idx_users_email_lower ON users (LOWER(email));
+EXCEPTION WHEN duplicate_table THEN NULL;
+WHEN unique_violation THEN
+  RAISE NOTICE 'Skipping idx_users_email_lower: some existing accounts still collide by case after best-effort cleanup above — resolve manually, then re-run migrations.';
+END $$;
+
 -- Uniqueness that used to be global now needs to be per-school
 ALTER TABLE classes  DROP CONSTRAINT IF EXISTS classes_name_key;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_classes_school_name ON classes(school_id, name);

@@ -2,6 +2,7 @@ require("dotenv").config();
 const bcrypt = require("bcryptjs");
 const { pool, query } = require("./pool");
 const { getSubjectsByCategory } = require("../utils/subjects");
+const { normalizeEmail } = require("../utils/normalizeEmail");
 
 const DEFAULT_CLASSES = [
   { name: "Nursery 1", category: "Nursery" },
@@ -21,7 +22,7 @@ async function seed() {
     // 1. Central Admin — platform-wide account, NOT tied to any single school.
     // Manages every school, their admins/teachers/students, DB storage
     // consumption, and can remove data platform-wide (see centralAdmin.js).
-    const centralEmail = process.env.CENTRAL_ADMIN_EMAIL || "admin@school.edu.ng";
+    const centralEmail = normalizeEmail(process.env.CENTRAL_ADMIN_EMAIL || "admin@school.edu.ng");
     const { rows: existingCentral } = await query("SELECT id FROM users WHERE email = $1", [centralEmail]);
     if (existingCentral.length === 0) {
       const hash = await bcrypt.hash(process.env.CENTRAL_ADMIN_PASSWORD || "Admin@123", 10);
@@ -39,8 +40,9 @@ async function seed() {
     // from the Central Admin above — most deployments won't set this; a
     // school's admin is normally created by the Central Admin or via
     // /api/auth/register instead).
-    if (process.env.SEED_ADMIN_EMAIL && process.env.SEED_ADMIN_EMAIL !== centralEmail) {
-      const email = process.env.SEED_ADMIN_EMAIL;
+    const seedAdminEmail = normalizeEmail(process.env.SEED_ADMIN_EMAIL);
+    if (seedAdminEmail && seedAdminEmail !== centralEmail) {
+      const email = seedAdminEmail;
       const { rows: existing } = await query("SELECT id FROM users WHERE email = $1", [email]);
       if (existing.length === 0) {
         const hash = await bcrypt.hash(process.env.SEED_ADMIN_PASSWORD || "Admin@123", 10);
