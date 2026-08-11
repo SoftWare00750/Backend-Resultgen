@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { runMigrations } = require("./db/migrate");
+const { seedCentralAdmins } = require("./db/seed");
 
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/users");
@@ -138,6 +139,20 @@ async function start() {
   } catch (err) {
     console.error("❌ Database migration failed on boot:", err.message);
     process.exit(1);
+  }
+
+  try {
+    // Guarantees admin@school.edu.ng and admin1@school.edu.ng (or whatever
+    // CENTRAL_ADMIN*_EMAIL is set to) always exist, on every boot, without a
+    // manual `npm run seed` step. Idempotent — skips accounts that already
+    // exist, so it's safe to run on every deploy/restart.
+    console.log("Ensuring default Central Admin accounts exist...");
+    await seedCentralAdmins();
+    console.log("✅ Central Admin accounts ready.");
+  } catch (err) {
+    // Don't crash the whole server over this — migrations already succeeded
+    // and most of the app works without it. Log loudly so it's not missed.
+    console.error("⚠️  Central Admin auto-seed failed:", err.message);
   }
 
   app.listen(PORT, () => {
