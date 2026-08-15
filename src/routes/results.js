@@ -115,6 +115,18 @@ router.post(
       return res.status(400).json({ error: "Missing required result fields" });
     }
 
+    // Keep this in sync with the `result_type` Postgres enum (schema.sql) and
+    // the frontend's ResultType union (src/lib/types/index.ts) / zod schema
+    // (src/lib/validation.ts). Validating here turns a mismatch into a clear
+    // 400 instead of a raw `invalid input value for enum result_type: "..."`
+    // error bubbling up from Postgres.
+    const VALID_RESULT_TYPES = ["CAT1", "CAT2", "Examination", "Midterm"];
+    if (!VALID_RESULT_TYPES.includes(resultType)) {
+      return res.status(400).json({
+        error: `Invalid result type "${resultType}". Must be one of: ${VALID_RESULT_TYPES.join(", ")}.`,
+      });
+    }
+
     // `student_id` is a UUID column referencing students(id). A malformed id
     // here (e.g. a "local_<timestamp>" placeholder left over from a student
     // record that never actually made it to the database) would otherwise

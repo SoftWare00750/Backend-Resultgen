@@ -380,3 +380,22 @@ CREATE TABLE IF NOT EXISTS platform_settings (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_by  UUID REFERENCES users(id) ON DELETE SET NULL
 );
+
+-- ============================================================
+-- MIGRATION: CAT1 / CAT2 result types
+-- ============================================================
+-- The teacher portal's "Create Result" form (src/app/teacher/results/page.tsx
+-- in the frontend repo) has only ever sent resultType 'CAT1', 'CAT2', or
+-- 'Examination' — see the ResultType union in src/lib/types/index.ts and the
+-- zod schema in src/lib/validation.ts, both of which enumerate exactly those
+-- three values. The result_type enum created above, however, only ever had
+-- 'Midterm' and 'Examination'. 'Midterm' was never sent by the frontend and
+-- 'CAT1'/'CAT2' were never in the enum, so every CAT1/CAT2 submission failed
+-- at the database with `invalid input value for enum result_type: "CAT1"`
+-- (or "CAT2") and no result row was ever created for those two (of the three
+-- possible) result types.
+--
+-- Requires PostgreSQL 12+ (ALTER TYPE ... ADD VALUE IF NOT EXISTS) — same
+-- requirement as the 'central_admin' migration above.
+ALTER TYPE result_type ADD VALUE IF NOT EXISTS 'CAT1';
+ALTER TYPE result_type ADD VALUE IF NOT EXISTS 'CAT2';
