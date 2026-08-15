@@ -4,6 +4,7 @@ const asyncHandler = require("../utils/asyncHandler");
 const { authenticate, requireRole } = require("../middleware/auth");
 const { calculateGrade } = require("../utils/grading");
 const overflow = require("../utils/dbOverflow");
+const { isUuid } = require("../utils/isUuid");
 
 router.use(authenticate);
 
@@ -41,6 +42,10 @@ router.get(
     }
 
     if (req.query.studentId) {
+      // A non-UUID studentId (e.g. a stale "local_<timestamp>" placeholder)
+      // can never match a real row — short-circuit instead of letting it
+      // hit Postgres and throw a type-cast error.
+      if (!isUuid(req.query.studentId)) return res.json([]);
       params.push(req.query.studentId);
       conditions.push(`student_id = $${params.length}`);
     }
@@ -108,6 +113,19 @@ router.post(
 
     if (!studentId || !className || !term || !session || !resultType) {
       return res.status(400).json({ error: "Missing required result fields" });
+    }
+
+    // `student_id` is a UUID column referencing students(id). A malformed id
+    // here (e.g. a "local_<timestamp>" placeholder left over from a student
+    // record that never actually made it to the database) would otherwise
+    // reach Postgres and fail as a raw, confusing type-cast error. Catch it
+    // early with a message that tells the teacher what to actually do.
+    if (!isUuid(studentId)) {
+      return res.status(400).json({
+        error:
+          "This student record isn't saved to the database yet, so a result can't be attached to it. " +
+          "Please re-add the student from the Students page and try again.",
+      });
     }
 
     const totalScore = subjects.reduce((sum, s) => sum + (Number(s.score) || 0), 0);
@@ -184,6 +202,9 @@ router.patch(
   "/:id",
   requireRole("admin", "teacher"),
   asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) {
+      return res.status(404).json({ error: "Result not found" });
+    }
     const { rows: existingRows } = await query(
       "SELECT * FROM results WHERE id = $1 AND school_id = $2",
       [req.params.id, req.user.schoolId]
@@ -283,6 +304,9 @@ router.delete(
   "/:id",
   requireRole("admin", "teacher"),
   asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) {
+      return res.status(404).json({ error: "Result not found" });
+    }
     const { rows } = await query(
       "DELETE FROM results WHERE id = $1 AND school_id = $2 RETURNING id",
       [req.params.id, req.user.schoolId]

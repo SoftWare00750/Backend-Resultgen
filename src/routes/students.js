@@ -3,6 +3,7 @@ const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { authenticate, requireRole } = require("../middleware/auth");
 const overflow = require("../utils/dbOverflow");
+const { isUuid } = require("../utils/isUuid");
 
 router.use(authenticate);
 
@@ -118,6 +119,10 @@ router.post(
 router.patch(
   "/:id",
   asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) {
+      return res.status(404).json({ error: "Student not found" });
+    }
+
     const {
       name, class: className, dateOfBirth, gender,
       guardianName, guardianPhone, address, photoUrl,
@@ -164,6 +169,9 @@ router.patch(
 router.delete(
   "/:id",
   asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) {
+      return res.status(404).json({ error: "Student not found" });
+    }
     const { rows } = await query(
       "DELETE FROM students WHERE id = $1 AND school_id = $2 RETURNING id",
       [req.params.id, req.user.schoolId]
