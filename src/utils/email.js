@@ -86,6 +86,7 @@ async function sendViaResend({ apiKey, from }, mail) {
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
+    signal: AbortSignal.timeout(10000), // never hang longer than 10s
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",

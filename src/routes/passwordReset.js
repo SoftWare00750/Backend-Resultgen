@@ -91,14 +91,23 @@ router.post(
       [email, hashCode(code), now.toISOString(), expiresAt.toISOString()]
     );
 
-    const emailResult = await sendPasswordResetCodeEmail(email, code);
+    // Don't make the user wait on the email provider — respond right away and
+    // deliver the email in the background. Failures are logged server-side.
+    sendPasswordResetCodeEmail(email, code).catch((err) => {
+      console.error("[password-reset] email failed:", err.message);
+    });
+
+    const devMode = !(
+      process.env.RESEND_API_KEY ||
+      (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)
+    );
 
     res.status(200).json({
       ...genericResponse,
-      message: emailResult.devMode
+      message: devMode
         ? "Reset code generated — email is not configured on this server, check the backend logs for the code."
         : genericResponse.message,
-      devMode: emailResult.devMode,
+      devMode,
     });
   })
 );
