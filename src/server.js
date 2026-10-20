@@ -13,6 +13,7 @@ const resultRoutes = require("./routes/results");
 const sessionRoutes = require("./routes/sessions");
 const schoolRoutes = require("./routes/school");
 const adminSignupRoutes = require("./routes/adminSignup");
+const passwordResetRoutes = require("./routes/passwordReset");
 const paymentRoutes = require("./routes/payments");
 const centralAdminRoutes = require("./routes/centralAdmin");
 
@@ -65,7 +66,7 @@ app.get("/", (req, res) => {
     message: "RGS API is running",
     version: "1.0.0",
     endpoints:
-      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school, /api/admin-signup, /api/payments, /api/central",
+      "/health, /api/auth, /api/users, /api/classes, /api/students, /api/results, /api/sessions, /api/school, /api/admin-signup, /api/password-reset, /api/payments, /api/central",
   });
 });
 
@@ -82,6 +83,7 @@ app.use("/api/results", resultRoutes);
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/school", schoolRoutes);
 app.use("/api/admin-signup", adminSignupRoutes);
+app.use("/api/password-reset", passwordResetRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/central", centralAdminRoutes);
 

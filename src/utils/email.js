@@ -279,7 +279,52 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
       </p>
     </div>`;
 
-  const mail = { to: toEmail, subject, text, html };
+  return deliverCodeEmail({ to: toEmail, subject, text, html }, code);
+}
+
+/**
+ * Sends (or, in dev mode, logs) the 6-digit code a user needs to reset a
+ * forgotten password. Uses exactly the same provider selection and
+ * error handling as sendAdminAuthCodeEmail (Resend -> Gmail SMTP -> console).
+ */
+async function sendPasswordResetCodeEmail(toEmail, code) {
+  const subject = "Your Result Generation System password reset code";
+  const text =
+    `Your password reset code is: ${code}\n\n` +
+    `This code expires in 10 minutes. If you didn't request a password reset, ` +
+    `you can ignore this email — your password will not change.\n\n` +
+    `You can request a new code after 30 seconds if this one doesn't arrive.`;
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;">
+      <h2 style="color:#111827;">Reset your password</h2>
+      <p style="color:#4B5563;font-size:14px;">
+        Use the code below to choose a new password for your
+        <strong>Result Generation System</strong> account.
+      </p>
+      <div style="font-size:32px;font-weight:800;letter-spacing:6px;background:#EEF4FF;
+                  color:#0c0c0c;padding:16px 24px;border-radius:10px;text-align:center;margin:20px 0;">
+        ${code}
+      </div>
+      <p style="color:#6B7280;font-size:12px;">
+        This code expires in 10 minutes. Didn't request this? You can safely ignore this
+        email — your password will not change.
+      </p>
+    </div>`;
+
+  return deliverCodeEmail({ to: toEmail, subject, text, html }, code);
+}
+
+/**
+ * Shared delivery logic for every code email. Provider selection (checked
+ * in this order):
+ *   1. RESEND_API_KEY set            -> send via Resend's HTTP API
+ *   2. GMAIL_USER + GMAIL_APP_PASSWORD set -> send via Gmail SMTP
+ *   3. neither set                   -> log the code to the console (dev mode)
+ *
+ * Set EMAIL_PROVIDER=smtp to force Gmail SMTP even if RESEND_API_KEY is
+ * also set (useful for testing the SMTP path specifically).
+ */
+async function deliverCodeEmail(mail, code) {
 
   const forceProvider = process.env.EMAIL_PROVIDER?.trim().toLowerCase();
   const resendConfig = getResendConfig();
@@ -291,10 +336,10 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
   if (useResend && resendConfig) {
     try {
       const { messageId } = await sendViaResend(resendConfig, mail);
-      console.log(`[email] Sent auth code to ${toEmail} via Resend (id: ${messageId})`);
+      console.log(`[email] Sent auth code to ${mail.to} via Resend (id: ${messageId})`);
       return { devMode: false, sent: true, provider: "resend", messageId };
     } catch (err) {
-      console.error(`[email] Resend send to ${toEmail} failed:`, err.message);
+      console.error(`[email] Resend send to ${mail.to} failed:`, err.message);
       console.error(`[email] For reference, the code that failed to send was: ${code}`);
 
       let hint = "";
@@ -329,10 +374,10 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
   if (useSmtp && gmailCreds) {
     try {
       const { messageId } = await sendViaGmailSmtp(gmailCreds, mail);
-      console.log(`[email] Sent auth code to ${toEmail} via Gmail SMTP (id: ${messageId})`);
+      console.log(`[email] Sent auth code to ${mail.to} via Gmail SMTP (id: ${messageId})`);
       return { devMode: false, sent: true, provider: "smtp", messageId };
     } catch (lastErr) {
-      console.error(`[email] Failed to send to ${toEmail}:`, lastErr.message);
+      console.error(`[email] Failed to send to ${mail.to}:`, lastErr.message);
       console.error(`[email] For reference, the code that failed to send was: ${code}`);
 
       let hint = "";
@@ -354,7 +399,7 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
   }
 
   // No provider configured — dev mode.
-  console.log(`[email:dev-mode] Auth code for ${toEmail}: ${code}`);
+  console.log(`[email:dev-mode] Auth code for ${mail.to}: ${code}`);
   console.warn(
     "[email] Neither RESEND_API_KEY nor GMAIL_USER/GMAIL_APP_PASSWORD are set — auth code emails are only logged " +
     "to the console. Set RESEND_API_KEY in your .env (recommended, see env.example) to actually send mail."
@@ -362,4 +407,4 @@ async function sendAdminAuthCodeEmail(toEmail, code) {
   return { devMode: true, sent: false };
 }
 
-module.exports = { sendAdminAuthCodeEmail };
+module.exports = { sendAdminAuthCodeEmail, sendPasswordResetCodeEmail };

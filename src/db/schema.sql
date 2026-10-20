@@ -91,6 +91,22 @@ CREATE TABLE IF NOT EXISTS admin_signup_codes (
 );
 CREATE INDEX IF NOT EXISTS idx_admin_signup_codes_email ON admin_signup_codes(email);
 
+-- ---------- PASSWORD RESET CODES ----------
+-- One row per email address, same pattern as admin_signup_codes. The 6-digit
+-- code is stored only as a SHA-256 hash, so a database leak does not expose
+-- live reset codes. Re-requesting overwrites the row, subject to a 30 second
+-- resend cooldown. The row is deleted as soon as the password is changed.
+CREATE TABLE IF NOT EXISTS password_reset_codes (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email          VARCHAR(255) NOT NULL UNIQUE,
+  code_hash      VARCHAR(64) NOT NULL,
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  last_sent_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at     TIMESTAMPTZ NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_password_reset_codes_email ON password_reset_codes(email);
+
 -- ---------- SUBSCRIPTIONS (one per Admin / school) ----------
 CREATE TABLE IF NOT EXISTS subscriptions (
   id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
