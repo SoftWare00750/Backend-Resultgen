@@ -401,7 +401,13 @@ async function deliverCodeEmail(mail, code) {
     brevoConfig && {
       name: "brevo",
       send: () => sendViaBrevo(brevoConfig, mail),
-      hint: () => "",
+      hint: (err) => {
+        const m = err.message || "";
+        if (err.status === 401) return " (Brevo rejected the API key — regenerate it and paste it without spaces or quotes.)";
+        if (/sender|from/i.test(m)) return " (BREVO_FROM_EMAIL must exactly match a sender that is verified in Brevo under Settings > Senders, Domains, IPs > Senders.)";
+        if (err.status === 403 || /ip|unrecognised|not allowed/i.test(m)) return " (Brevo may be blocking this server's IP. In Brevo go to Security > Authorised IPs and deactivate IP blocking, or add your host's IPs.)";
+        return "";
+      },
     },
     resendConfig && {
       name: "resend",
@@ -442,22 +448,28 @@ async function deliverCodeEmail(mail, code) {
     return { devMode: true, sent: false };
   }
 
-  let lastErr = null;
-  let lastHint = "";
+  // Try each provider in order; remember EVERY failure so the final error
+  // shows what went wrong with each one (not just the last).
+  const failures = [];
   for (const provider of providers) {
     try {
       const { messageId } = await provider.send();
       console.log(`[email] Sent auth code to ${mail.to} via ${provider.name} (id: ${messageId})`);
       return { devMode: false, sent: true, provider: provider.name, messageId };
     } catch (err) {
-      lastErr = err;
-      lastHint = provider.hint(err);
+      failures.push(`${provider.name}: ${err.message}${provider.hint(err)}`);
       console.error(`[email] ${provider.name} send to ${mail.to} failed: ${err.message}`);
     }
   }
 
+  const skipped = [];
+  if (!brevoConfig) {
+    skipped.push("brevo: NOT configured on this server (BREVO_API_KEY and/or BREVO_FROM_EMAIL missing)");
+  }
   console.error(`[email] All providers failed. The code that failed to send was: ${code}`);
-  const wrapped = new Error(`Could not send verification email: ${lastErr.message}${lastHint}`);
+  const wrapped = new Error(
+    `Could not send verification email. ${[...failures, ...skipped].join(" | ")}`
+  );
   wrapped.status = 502;
   throw wrapped;
 }
