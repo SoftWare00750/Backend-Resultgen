@@ -28,3 +28,5 @@ yarn-error.log*
 *.p12
 *.pfx
 .env
+
+.env

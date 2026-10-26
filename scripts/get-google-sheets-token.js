@@ -59,7 +59,7 @@ const authUrl = oAuth2Client.generateAuthUrl({
 });
 
 console.log("── Google Sheets overflow store — one-time authorization ───────────");
-console.log("\n1. Open this URL in a browser and sign in as tdsoft01@gmail.com:\n");
+console.log("\n1. Open this cRL in a browser and sign in as tdsoft01@gmail.com:\n");
 console.log(authUrl);
 console.log("\n2. Approve access. You'll be redirected back here automatically.\n");
 console.log(`Waiting for the redirect on ${REDIRECT_URI} ...`);

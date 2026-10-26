@@ -98,6 +98,7 @@ router.post(
     });
 
     const devMode = !(
+      (process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL) ||
       process.env.RESEND_API_KEY ||
       (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)
     );

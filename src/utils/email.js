@@ -114,6 +114,48 @@ async function sendViaResend({ apiKey, from }, mail) {
   return { messageId: data.id };
 }
 
+// ───────────────────────────── Brevo (HTTP API) ──────────────────────────
+// Sends over HTTPS (port 443) like Resend, but does NOT require owning a
+// domain: you only verify a single sender address (e.g. a Gmail address) in
+// Brevo, and it can then deliver to ANY recipient. Free tier: 300 emails/day.
+
+function getBrevoConfig() {
+  const apiKey = process.env.BREVO_API_KEY?.trim();
+  const fromEmail = process.env.BREVO_FROM_EMAIL?.trim();
+  if (!apiKey || !fromEmail) return null;
+  const fromName = process.env.BREVO_FROM_NAME?.trim() || "Result Generation System";
+  return { apiKey, fromEmail, fromName };
+}
+
+async function sendViaBrevo({ apiKey, fromEmail, fromName }, mail) {
+  const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    signal: AbortSignal.timeout(10000),
+    headers: {
+      "api-key": apiKey,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      sender: { name: fromName, email: fromEmail },
+      to: [{ email: mail.to }],
+      subject: mail.subject,
+      textContent: mail.text,
+      htmlContent: mail.html,
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(
+      `Brevo API error (${res.status}): ${data?.message || res.statusText}`
+    );
+    err.status = res.status;
+    throw err;
+  }
+  return { messageId: data.messageId };
+}
+
 // ───────────────────────────── Gmail SMTP (fallback) ─────────────────────
 
 // In-memory cache of the resolved IPv4 address for smtp.gmail.com so we
@@ -316,96 +358,108 @@ async function sendPasswordResetCodeEmail(toEmail, code) {
 }
 
 /**
- * Shared delivery logic for every code email. Provider selection (checked
- * in this order):
- *   1. RESEND_API_KEY set            -> send via Resend's HTTP API
- *   2. GMAIL_USER + GMAIL_APP_PASSWORD set -> send via Gmail SMTP
- *   3. neither set                   -> log the code to the console (dev mode)
+ * Shared delivery logic for every code email.
  *
- * Set EMAIL_PROVIDER=smtp to force Gmail SMTP even if RESEND_API_KEY is
- * also set (useful for testing the SMTP path specifically).
+ * Providers are tried in this order, and if one is configured but FAILS
+ * (e.g. Resend's sandbox 403), the next configured provider is tried
+ * instead of immediately failing the signup:
+ *   1. Brevo   (BREVO_API_KEY + BREVO_FROM_EMAIL)       - HTTPS, any recipient, no domain needed
+ *   2. Resend  (RESEND_API_KEY [+ RESEND_FROM_EMAIL])    - HTTPS, needs a verified domain for real recipients
+ *   3. Gmail SMTP (GMAIL_USER + GMAIL_APP_PASSWORD)      - blocked on many PaaS hosts (e.g. Render free tier)
+ *   4. none configured -> log the code to the console (dev mode)
+ *
+ * Set EMAIL_PROVIDER=brevo|resend|smtp to force exactly one provider.
  */
-async function deliverCodeEmail(mail, code) {
+function resendHint(err, resendConfig) {
+  const msg = err.message || "";
+  if (err.status === 403 && /domain is not verified/i.test(msg)) {
+    const consumerDomain = /@(gmail|yahoo|outlook|hotmail|live|icloud)\.com\s*$/i.test(resendConfig.from);
+    return consumerDomain
+      ? " (You can't send FROM a @gmail.com/@yahoo.com/etc address through Resend. Use a domain you own, " +
+        "or set BREVO_API_KEY + BREVO_FROM_EMAIL to send from a single verified address instead.)"
+      : " (RESEND_FROM_EMAIL is on a domain you haven't verified in Resend. Verify it at " +
+        "https://resend.com/domains, or set BREVO_API_KEY + BREVO_FROM_EMAIL as an alternative.)";
+  }
+  if (err.status === 403 && /only send testing emails to your own email/i.test(msg)) {
+    return (
+      " (Resend's sandbox sender can only deliver to the email your Resend account is registered with. " +
+      "For real signups either verify a domain at https://resend.com/domains and set RESEND_FROM_EMAIL, " +
+      "or set BREVO_API_KEY + BREVO_FROM_EMAIL to send to any address without owning a domain.)"
+    );
+  }
+  return "";
+}
 
-  const forceProvider = process.env.EMAIL_PROVIDER?.trim().toLowerCase();
+async function deliverCodeEmail(mail, code) {
+  const forced = process.env.EMAIL_PROVIDER?.trim().toLowerCase();
+  const brevoConfig = getBrevoConfig();
   const resendConfig = getResendConfig();
   const gmailCreds = getGmailCredentials();
 
-  const useResend = forceProvider === "resend" || (!forceProvider && !!resendConfig);
-  const useSmtp = forceProvider === "smtp" || (!forceProvider && !resendConfig && !!gmailCreds);
+  // Build the ordered list of providers to try.
+  const all = [
+    brevoConfig && {
+      name: "brevo",
+      send: () => sendViaBrevo(brevoConfig, mail),
+      hint: () => "",
+    },
+    resendConfig && {
+      name: "resend",
+      send: () => sendViaResend(resendConfig, mail),
+      hint: (err) => resendHint(err, resendConfig),
+    },
+    gmailCreds && {
+      name: "smtp",
+      send: () => sendViaGmailSmtp(gmailCreds, mail),
+      hint: (err) => {
+        if (err.responseCode === 535 || /invalid login|username and password/i.test(err.message || "")) {
+          return " (Gmail rejected the credentials — use a 16-character App Password, not your normal password.)";
+        }
+        if (isConnectionLevelError(err)) {
+          return " (This host appears to block outbound SMTP. Use Brevo or Resend over HTTPS instead.)";
+        }
+        return "";
+      },
+    },
+  ].filter(Boolean);
 
-  if (useResend && resendConfig) {
+  const providers = forced ? all.filter((p) => p.name === forced) : all;
+
+  if (providers.length === 0) {
+    if (forced) {
+      const err = new Error(
+        `EMAIL_PROVIDER=${forced} is set but that provider's credentials are missing.`
+      );
+      err.status = 502;
+      throw err;
+    }
+    // No provider configured — dev mode.
+    console.log(`[email:dev-mode] Auth code for ${mail.to}: ${code}`);
+    console.warn(
+      "[email] No email provider configured (BREVO_API_KEY / RESEND_API_KEY / GMAIL_USER+GMAIL_APP_PASSWORD) — " +
+        "codes are only logged to the console."
+    );
+    return { devMode: true, sent: false };
+  }
+
+  let lastErr = null;
+  let lastHint = "";
+  for (const provider of providers) {
     try {
-      const { messageId } = await sendViaResend(resendConfig, mail);
-      console.log(`[email] Sent auth code to ${mail.to} via Resend (id: ${messageId})`);
-      return { devMode: false, sent: true, provider: "resend", messageId };
+      const { messageId } = await provider.send();
+      console.log(`[email] Sent auth code to ${mail.to} via ${provider.name} (id: ${messageId})`);
+      return { devMode: false, sent: true, provider: provider.name, messageId };
     } catch (err) {
-      console.error(`[email] Resend send to ${mail.to} failed:`, err.message);
-      console.error(`[email] For reference, the code that failed to send was: ${code}`);
-
-      let hint = "";
-      const msg = err.message || "";
-      if (err.status === 403 && /domain is not verified/i.test(msg)) {
-        const consumerDomain = /@(gmail|yahoo|outlook|hotmail|live|icloud)\.com\s*$/i.test(resendConfig.from);
-        hint = consumerDomain
-          ? " (You can't send FROM a @gmail.com/@yahoo.com/etc address through Resend — that domain belongs to " +
-            "Google, not you, and Resend can only send as domains you've proven you own via DNS records. To send " +
-            "as this exact Gmail address, use Gmail's own SMTP instead: set GMAIL_USER=" + resendConfig.from +
-            " and GMAIL_APP_PASSWORD (16-char App Password from https://myaccount.google.com/apppasswords, needs " +
-            "2-Step Verification on), then set EMAIL_PROVIDER=smtp — or simply remove RESEND_API_KEY — so this app " +
-            "uses that path instead of Resend.)"
-          : " (RESEND_FROM_EMAIL is set to an address on a domain you haven't verified in Resend. Verify your " +
-            "own domain at https://resend.com/domains and set RESEND_FROM_EMAIL to an address on it, or unset " +
-            "RESEND_FROM_EMAIL entirely to use Resend's sandbox sender onboarding@resend.dev for testing — note " +
-            "the sandbox sender can only deliver to the email address you signed up to Resend with.)";
-      } else if (err.status === 403 && /only send testing emails to your own email/i.test(msg)) {
-        hint =
-          ` (You're using Resend's sandbox sender (no verified domain), which can only deliver to the email ` +
-          `address your Resend account is registered with. To test right now, request the code using that same ` +
-          `email address. To send to any recipient — required for real signups — verify a domain you own at ` +
-          `https://resend.com/domains, then set RESEND_FROM_EMAIL to an address on it.)`;
-      }
-
-      const wrapped = new Error(`Could not send verification email: ${err.message}${hint}`);
-      wrapped.status = 502;
-      throw wrapped;
+      lastErr = err;
+      lastHint = provider.hint(err);
+      console.error(`[email] ${provider.name} send to ${mail.to} failed: ${err.message}`);
     }
   }
 
-  if (useSmtp && gmailCreds) {
-    try {
-      const { messageId } = await sendViaGmailSmtp(gmailCreds, mail);
-      console.log(`[email] Sent auth code to ${mail.to} via Gmail SMTP (id: ${messageId})`);
-      return { devMode: false, sent: true, provider: "smtp", messageId };
-    } catch (lastErr) {
-      console.error(`[email] Failed to send to ${mail.to}:`, lastErr.message);
-      console.error(`[email] For reference, the code that failed to send was: ${code}`);
-
-      let hint = "";
-      if (lastErr.responseCode === 535 || /invalid login|username and password/i.test(lastErr.message || "")) {
-        hint =
-          " (Gmail rejected the credentials — confirm GMAIL_APP_PASSWORD is a 16-character App Password from " +
-          "https://myaccount.google.com/apppasswords, generated with 2-Step Verification turned on, not your regular account password.)";
-      } else if (isConnectionLevelError(lastErr)) {
-        hint =
-          " (Could not open a connection to Gmail on port 465 or 587 even over IPv4 — this host's outbound SMTP is " +
-          "genuinely blocked, not just an IPv6 routing issue. Set RESEND_API_KEY (see env.example) to send over HTTPS " +
-          "instead, which does not require outbound SMTP at all.)";
-      }
-
-      const wrapped = new Error(`Could not send verification email: ${lastErr.message}${hint}`);
-      wrapped.status = 502;
-      throw wrapped;
-    }
-  }
-
-  // No provider configured — dev mode.
-  console.log(`[email:dev-mode] Auth code for ${mail.to}: ${code}`);
-  console.warn(
-    "[email] Neither RESEND_API_KEY nor GMAIL_USER/GMAIL_APP_PASSWORD are set — auth code emails are only logged " +
-    "to the console. Set RESEND_API_KEY in your .env (recommended, see env.example) to actually send mail."
-  );
-  return { devMode: true, sent: false };
+  console.error(`[email] All providers failed. The code that failed to send was: ${code}`);
+  const wrapped = new Error(`Could not send verification email: ${lastErr.message}${lastHint}`);
+  wrapped.status = 502;
+  throw wrapped;
 }
 
 module.exports = { sendAdminAuthCodeEmail, sendPasswordResetCodeEmail };
