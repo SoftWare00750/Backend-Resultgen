@@ -151,9 +151,23 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Only one active session at a time
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
-  ON sessions (is_active) WHERE is_active = TRUE;
+-- Only one active session at a time (legacy, single-tenant databases only).
+-- Once multi-tenancy is applied (sessions.school_id exists) this global index
+-- is obsolete: each school has its own active session, and it is replaced by
+-- idx_sessions_one_active_per_school further down. It must NOT be recreated on
+-- a multi-tenant database, otherwise every boot fails with
+-- 'could not create unique index "idx_sessions_one_active"' as soon as two
+-- schools each have an active session.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'sessions' AND column_name = 'school_id'
+  ) THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
+      ON sessions (is_active) WHERE is_active = TRUE;
+  END IF;
+END $$;
 
 -- ---------- CLASSES ----------
 CREATE TABLE IF NOT EXISTS classes (
@@ -352,6 +366,18 @@ ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_year_key;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_school_year ON sessions(school_id, year);
 
 DROP INDEX IF EXISTS idx_sessions_one_active;
+
+-- If a school somehow has several active sessions, keep only the newest one
+-- active so the per-school unique index below can be created.
+UPDATE sessions s SET is_active = FALSE
+WHERE s.is_active = TRUE
+  AND EXISTS (
+    SELECT 1 FROM sessions n
+    WHERE n.is_active = TRUE
+      AND n.school_id IS NOT DISTINCT FROM s.school_id
+      AND (n.created_at, n.id) > (s.created_at, s.id)
+  );
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active_per_school
   ON sessions (school_id) WHERE is_active = TRUE;
 
