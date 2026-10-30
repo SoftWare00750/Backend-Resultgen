@@ -46,11 +46,67 @@ function getCentralAdminAccounts() {
 }
 
 /**
+ * The platform owner's account: the one centralized admin over every school,
+ * admin, teacher, parent and student. Override with PRIMARY_CENTRAL_ADMIN_EMAIL.
+ */
+const DEFAULT_PRIMARY_CENTRAL_ADMIN_EMAIL = "otunes7175@gmail.com";
+
+function getPrimaryCentralAdminEmail() {
+  return normalizeEmail(process.env.PRIMARY_CENTRAL_ADMIN_EMAIL || DEFAULT_PRIMARY_CENTRAL_ADMIN_EMAIL);
+}
+
+/**
+ * Guarantees the primary account is a central_admin:
+ *  - If the email already exists (e.g. it was registered as a school admin),
+ *    it is PROMOTED in place, so the existing password keeps working. Its
+ *    school_id is left untouched (nothing is deleted or detached).
+ *  - If it does not exist, it is created only when PRIMARY_CENTRAL_ADMIN_PASSWORD
+ *    is set. No password is ever hard-coded for this account.
+ * Idempotent; runs on every boot.
+ */
+async function ensurePrimaryCentralAdmin() {
+  const email = getPrimaryCentralAdminEmail();
+  const { rows } = await query("SELECT id, role, deleted_at FROM users WHERE email = $1", [email]);
+
+  if (rows.length) {
+    if (rows[0].role !== "central_admin" || rows[0].deleted_at) {
+      await query("UPDATE users SET role = 'central_admin', deleted_at = NULL WHERE id = $1", [rows[0].id]);
+      console.log(`✅ Promoted ${email} to Central Admin (was: ${rows[0].role})`);
+    } else {
+      console.log(`ℹ️  Primary Central Admin already set: ${email}`);
+    }
+    return email;
+  }
+
+  const password = process.env.PRIMARY_CENTRAL_ADMIN_PASSWORD;
+  if (!password) {
+    console.warn(
+      `⚠️  ${email} has no account yet. Set PRIMARY_CENTRAL_ADMIN_PASSWORD (min 8 chars) and restart, ` +
+      `or register that email once and it will be promoted automatically on the next boot.`
+    );
+    return email;
+  }
+  if (password.length < 8) {
+    console.warn("⚠️  PRIMARY_CENTRAL_ADMIN_PASSWORD must be at least 8 characters — skipped.");
+    return email;
+  }
+  const hash = await bcrypt.hash(password, 10);
+  await query(
+    `INSERT INTO users (name, email, password_hash, role, school_id)
+     VALUES ($1, $2, $3, 'central_admin', NULL)`,
+    [process.env.PRIMARY_CENTRAL_ADMIN_NAME || "Platform Administrator", email, hash]
+  );
+  console.log(`✅ Created primary Central Admin: ${email}`);
+  return email;
+}
+
+/**
  * Idempotent — safe to call on every server boot (see server.js) as well as
  * from the CLI (`npm run seed`). Only inserts a row when that email doesn't
  * already exist, so it never overwrites a password someone has since changed.
  */
 async function seedCentralAdmins() {
+  const primaryEmail = await ensurePrimaryCentralAdmin();
   const accounts = getCentralAdminAccounts();
   for (const acct of accounts) {
     const email = normalizeEmail(acct.email);
@@ -67,7 +123,7 @@ async function seedCentralAdmins() {
       console.log(`ℹ️  Central Admin already exists, skipping: ${email}`);
     }
   }
-  return accounts.map((a) => normalizeEmail(a.email));
+  return [primaryEmail, ...accounts.map((a) => normalizeEmail(a.email))];
 }
 
 /**
@@ -125,7 +181,7 @@ async function seedAll() {
   console.log("🎉 Seed complete.");
 }
 
-module.exports = { seedCentralAdmins, seedLegacySchoolAdmin, seedAll };
+module.exports = { seedCentralAdmins, seedLegacySchoolAdmin, seedAll, ensurePrimaryCentralAdmin, getPrimaryCentralAdminEmail };
 
 // Only run standalone when invoked as `node src/db/seed.js` / `npm run seed`.
 // When required as a module (server.js imports seedCentralAdmins on boot),

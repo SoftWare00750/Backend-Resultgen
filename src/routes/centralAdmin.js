@@ -4,6 +4,7 @@ const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
 const { normalizeEmail } = require("../utils/normalizeEmail");
 const { authenticate, requireRole } = require("../middleware/auth");
+const { getPrimaryCentralAdminEmail } = require("../db/seed");
 
 // Every route here is Central Admin only.
 router.use(authenticate, requireRole("central_admin"));
@@ -300,6 +301,10 @@ router.delete(
   asyncHandler(async (req, res) => {
     if (req.params.id === req.user.id) {
       return res.status(400).json({ error: "You cannot delete your own account" });
+    }
+    const { rows: target } = await query("SELECT email FROM users WHERE id = $1", [req.params.id]);
+    if (target[0] && target[0].email === getPrimaryCentralAdminEmail()) {
+      return res.status(403).json({ error: "The primary Central Admin account cannot be removed" });
     }
     const { rows } = await query(
       "UPDATE users SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id",
