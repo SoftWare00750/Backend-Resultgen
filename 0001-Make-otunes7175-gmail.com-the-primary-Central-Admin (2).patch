@@ -1,0 +1,150 @@
+From 48f96048a755349f14ef3cf7e58d7259659da7e2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 12:14:32 +0100
+Subject: [PATCH] Make otunes7175@gmail.com the primary Central Admin
+
+Promote (or create, when a password is set) the platform owner account on boot, and protect it from removal by other central admins.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011UE7NCFwUjkd4CbsUtJYWT
+---
+ env.example                |  7 +++++
+ src/db/seed.js             | 60 ++++++++++++++++++++++++++++++++++++--
+ src/routes/centralAdmin.js |  5 ++++
+ 3 files changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/env.example b/env.example
+index 574fd21..00d1c96 100644
+--- a/env.example
++++ b/env.example
+@@ -21,6 +21,13 @@ CLIENT_ORIGIN=http://localhost:3000
+ # Central Admin accounts — auto-seeded automatically on every server boot
+ # (src/server.js), no manual `npm run seed` step required. Two ship by
+ # default; change these passwords after first login in production.
++# PRIMARY central admin (platform owner). If this email already has an account
++# (even as a school admin) it is promoted to central_admin on boot and keeps
++# its password. If it has no account, one is created only when a password is set.
++PRIMARY_CENTRAL_ADMIN_EMAIL=otunes7175@gmail.com
++PRIMARY_CENTRAL_ADMIN_PASSWORD=
++PRIMARY_CENTRAL_ADMIN_NAME=Platform Administrator
++
+ CENTRAL_ADMIN_EMAIL=admin@school.edu.ng
+ CENTRAL_ADMIN_PASSWORD=Admin@123
+ CENTRAL_ADMIN_NAME=Central Administrator
+diff --git a/src/db/seed.js b/src/db/seed.js
+index 30f5c6c..515ef6c 100644
+--- a/src/db/seed.js
++++ b/src/db/seed.js
+@@ -45,12 +45,68 @@ function getCentralAdminAccounts() {
+   ];
+ }
+ 
++/**
++ * The platform owner's account: the one centralized admin over every school,
++ * admin, teacher, parent and student. Override with PRIMARY_CENTRAL_ADMIN_EMAIL.
++ */
++const DEFAULT_PRIMARY_CENTRAL_ADMIN_EMAIL = "otunes7175@gmail.com";
++
++function getPrimaryCentralAdminEmail() {
++  return normalizeEmail(process.env.PRIMARY_CENTRAL_ADMIN_EMAIL || DEFAULT_PRIMARY_CENTRAL_ADMIN_EMAIL);
++}
++
++/**
++ * Guarantees the primary account is a central_admin:
++ *  - If the email already exists (e.g. it was registered as a school admin),
++ *    it is PROMOTED in place, so the existing password keeps working. Its
++ *    school_id is left untouched (nothing is deleted or detached).
++ *  - If it does not exist, it is created only when PRIMARY_CENTRAL_ADMIN_PASSWORD
++ *    is set. No password is ever hard-coded for this account.
++ * Idempotent; runs on every boot.
++ */
++async function ensurePrimaryCentralAdmin() {
++  const email = getPrimaryCentralAdminEmail();
++  const { rows } = await query("SELECT id, role, deleted_at FROM users WHERE email = $1", [email]);
++
++  if (rows.length) {
++    if (rows[0].role !== "central_admin" || rows[0].deleted_at) {
++      await query("UPDATE users SET role = 'central_admin', deleted_at = NULL WHERE id = $1", [rows[0].id]);
++      console.log(`✅ Promoted ${email} to Central Admin (was: ${rows[0].role})`);
++    } else {
++      console.log(`ℹ️  Primary Central Admin already set: ${email}`);
++    }
++    return email;
++  }
++
++  const password = process.env.PRIMARY_CENTRAL_ADMIN_PASSWORD;
++  if (!password) {
++    console.warn(
++      `⚠️  ${email} has no account yet. Set PRIMARY_CENTRAL_ADMIN_PASSWORD (min 8 chars) and restart, ` +
++      `or register that email once and it will be promoted automatically on the next boot.`
++    );
++    return email;
++  }
++  if (password.length < 8) {
++    console.warn("⚠️  PRIMARY_CENTRAL_ADMIN_PASSWORD must be at least 8 characters — skipped.");
++    return email;
++  }
++  const hash = await bcrypt.hash(password, 10);
++  await query(
++    `INSERT INTO users (name, email, password_hash, role, school_id)
++     VALUES ($1, $2, $3, 'central_admin', NULL)`,
++    [process.env.PRIMARY_CENTRAL_ADMIN_NAME || "Platform Administrator", email, hash]
++  );
++  console.log(`✅ Created primary Central Admin: ${email}`);
++  return email;
++}
++
+ /**
+  * Idempotent — safe to call on every server boot (see server.js) as well as
+  * from the CLI (`npm run seed`). Only inserts a row when that email doesn't
+  * already exist, so it never overwrites a password someone has since changed.
+  */
+ async function seedCentralAdmins() {
++  const primaryEmail = await ensurePrimaryCentralAdmin();
+   const accounts = getCentralAdminAccounts();
+   for (const acct of accounts) {
+     const email = normalizeEmail(acct.email);
+@@ -67,7 +123,7 @@ async function seedCentralAdmins() {
+       console.log(`ℹ️  Central Admin already exists, skipping: ${email}`);
+     }
+   }
+-  return accounts.map((a) => normalizeEmail(a.email));
++  return [primaryEmail, ...accounts.map((a) => normalizeEmail(a.email))];
+ }
+ 
+ /**
+@@ -125,7 +181,7 @@ async function seedAll() {
+   console.log("🎉 Seed complete.");
+ }
+ 
+-module.exports = { seedCentralAdmins, seedLegacySchoolAdmin, seedAll };
++module.exports = { seedCentralAdmins, seedLegacySchoolAdmin, seedAll, ensurePrimaryCentralAdmin, getPrimaryCentralAdminEmail };
+ 
+ // Only run standalone when invoked as `node src/db/seed.js` / `npm run seed`.
+ // When required as a module (server.js imports seedCentralAdmins on boot),
+diff --git a/src/routes/centralAdmin.js b/src/routes/centralAdmin.js
+index dbf87ac..a782ab2 100644
+--- a/src/routes/centralAdmin.js
++++ b/src/routes/centralAdmin.js
+@@ -4,6 +4,7 @@ const { query } = require("../db/pool");
+ const asyncHandler = require("../utils/asyncHandler");
+ const { normalizeEmail } = require("../utils/normalizeEmail");
+ const { authenticate, requireRole } = require("../middleware/auth");
++const { getPrimaryCentralAdminEmail } = require("../db/seed");
+ 
+ // Every route here is Central Admin only.
+ router.use(authenticate, requireRole("central_admin"));
+@@ -301,6 +302,10 @@ router.delete(
+     if (req.params.id === req.user.id) {
+       return res.status(400).json({ error: "You cannot delete your own account" });
+     }
++    const { rows: target } = await query("SELECT email FROM users WHERE id = $1", [req.params.id]);
++    if (target[0] && target[0].email === getPrimaryCentralAdminEmail()) {
++      return res.status(403).json({ error: "The primary Central Admin account cannot be removed" });
++    }
+     const { rows } = await query(
+       "UPDATE users SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+       [req.params.id]
+-- 
+2.43.0
+
