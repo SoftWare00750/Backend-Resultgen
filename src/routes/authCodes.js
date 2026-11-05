@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const router = require("express").Router();
 const { query } = require("../db/pool");
 const asyncHandler = require("../utils/asyncHandler");
@@ -5,8 +6,9 @@ const { authenticate, requireRole } = require("../middleware/auth");
 
 router.use(authenticate, requireRole("admin"));
 
+// Codes are now reusable until they expire, so use a CSPRNG rather than Math.random().
 function generateSixDigitCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 // GET /api/auth-codes
@@ -29,16 +31,23 @@ router.post(
     if (!["teacher", "parent"].includes(role)) {
       return res.status(400).json({ error: "Invalid role — Admin/School Owner/School Proprietor accounts no longer use pre-issued codes" });
     }
-    const code = generateSixDigitCode();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
 
-    const { rows } = await query(
-      `INSERT INTO auth_codes (code, role, expires_at, created_by, school_id)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [code, role, expiresAt.toISOString(), req.user.id, req.user.schoolId]
-    );
-    res.status(201).json(rows[0]);
+    // `code` is globally UNIQUE; retry on the (rare) collision instead of 500ing.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const { rows } = await query(
+          `INSERT INTO auth_codes (code, role, expires_at, created_by, school_id)
+           VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+          [generateSixDigitCode(), role, expiresAt.toISOString(), req.user.id, req.user.schoolId]
+        );
+        return res.status(201).json(rows[0]);
+      } catch (err) {
+        if (err.code !== "23505") throw err; // not a unique violation
+      }
+    }
+    res.status(503).json({ error: "Could not generate a unique code, please try again" });
   })
 );
 

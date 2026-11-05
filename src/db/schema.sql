@@ -314,6 +314,13 @@ ALTER TABLE sessions    ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES scho
 ALTER TABLE school_info ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
 ALTER TABLE auth_codes  ADD COLUMN IF NOT EXISTS school_id  UUID REFERENCES schools(id) ON DELETE CASCADE;
 
+-- Auth codes are reusable until they expire or are deleted. `is_used` is kept
+-- only for backwards compatibility and is no longer read or written; usage is
+-- tracked with these two columns instead.
+ALTER TABLE auth_codes  ADD COLUMN IF NOT EXISTS use_count    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE auth_codes  ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+UPDATE auth_codes SET use_count = 1 WHERE is_used = TRUE AND use_count = 0;
+
 CREATE INDEX IF NOT EXISTS idx_users_school       ON users(school_id);
 CREATE INDEX IF NOT EXISTS idx_classes_school      ON classes(school_id);
 CREATE INDEX IF NOT EXISTS idx_students_school     ON students(school_id);

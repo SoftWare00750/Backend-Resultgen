@@ -95,11 +95,14 @@ router.post(
       // Teacher / Parent: still go through the Admin-issued auth_codes flow.
       if (!authCode) return res.status(400).json({ error: "Missing required fields" });
       const { rows: codes } = await query(
-        "SELECT * FROM auth_codes WHERE code = $1 AND role = $2 AND is_used = FALSE",
-        [authCode, role]
+        "SELECT * FROM auth_codes WHERE code = $1 AND role = $2",
+        [String(authCode).trim(), role]
       );
       authCodeRow = codes[0];
-      if (!authCodeRow) return res.status(400).json({ error: "Invalid or already used authorization code for this role" });
+      // Codes are reusable: the same code can register any number of
+      // teachers/parents under the issuing admin until it expires or the
+      // admin deletes it. `is_used` is deliberately NOT checked here.
+      if (!authCodeRow) return res.status(400).json({ error: "Invalid authorization code for this role" });
       if (new Date(authCodeRow.expires_at) < new Date()) {
         return res.status(400).json({ error: "Authorization code has expired" });
       }
@@ -152,7 +155,13 @@ router.post(
         user.id, subRows[0].id, paymentRow.id,
       ]);
     } else {
-      await query("UPDATE auth_codes SET is_used = TRUE, used_by = $1 WHERE id = $2", [email, authCodeRow.id]);
+      // Record usage for the admin's audit trail, but keep the code valid.
+      await query(
+        `UPDATE auth_codes
+            SET use_count = use_count + 1, used_by = $1, last_used_at = now()
+          WHERE id = $2`,
+        [email, authCodeRow.id]
+      );
     }
 
     const token = signToken(user);
