@@ -45,17 +45,14 @@ function createPool() {
     const fixed = stripSslParams(sanitizeDatabaseUrl(process.env.DATABASE_URL.trim()));
 
     return new Pool({
-      connectionString: fixed,
-      // Always disable certificate verification for Render/cloud-hosted Postgres.
-      // Render uses self-signed certs; rejectUnauthorized: false is the standard fix.
-      // NOTE: this option only takes effect because stripSslParams() above
-      // removes sslmode from the connection string first - see its comment.
-      ssl: {
-        rejectUnauthorized: false,
-      },
-    });
-  }
-
+  connectionString: fixed,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
   // Fallback: individual env vars (local development)
   const config = {
     host: process.env.PGHOST || "localhost",
