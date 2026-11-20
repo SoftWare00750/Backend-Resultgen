@@ -45,14 +45,16 @@ function createPool() {
     const fixed = stripSslParams(sanitizeDatabaseUrl(process.env.DATABASE_URL.trim()));
 
     return new Pool({
-  connectionString: fixed,
-  ssl: {
-    rejectUnauthorized: false,
-  },
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-});
+      connectionString: fixed,
+      ssl: {
+        rejectUnauthorized: false,
+      },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    });
+  }
+
   // Fallback: individual env vars (local development)
   const config = {
     host: process.env.PGHOST || "localhost",
@@ -69,7 +71,6 @@ function createPool() {
 
   return new Pool(config);
 }
-
 const pool = createPool();
 
 pool.on("error", (err) => {
